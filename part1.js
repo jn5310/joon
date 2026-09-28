@@ -154,16 +154,37 @@ if (inkR + 1 - start >= W * 0.2 || cols.length === 0) cols.push({ x0: start, x1:
 else cols[cols.length - 1].x1 = inkR + 1;
 return cols;
 }
-/** 박스 안의 잉크 영역에 딱 맞게 자르고 pad 만큼 여유를 준다. 잉크가 없으면 null */
-function trimBox(img, box, pad = 6) {
+/** 박스의 배경 밝기를 추정해 연한 그래프 축·격자까지 포함한다. 실제 픽셀은 바꾸지 않는다. */
+function trimThreshold(img, x0, y0, x1, y1) {
+const { data, width } = img;
+const samples = [];
+const sx = Math.max(1, Math.floor((x1 - x0) / 100));
+const sy = Math.max(1, Math.floor((y1 - y0) / 100));
+const add = (x, y) => {
+const i = (y * width + x) * 4;
+samples.push((data[i] * 299 + data[i + 1] * 587 + data[i + 2] * 114) / 1000);
+};
+for (let x = x0; x < x1; x += sx) { add(x, y0); add(x, y1 - 1); }
+for (let y = y0; y < y1; y += sy) { add(x0, y); add(x1 - 1, y); }
+samples.sort((a, b) => a - b);
+const background = samples[Math.floor(samples.length / 2)] ?? 255;
+return Math.max(DARK, Math.min(230, background - 15));
+}
+/** 박스 안의 잉크 영역에 맞게 자르되 밝은 도형선과 안전 여백을 보존한다. */
+function trimBox(img, box, pad = null) {
 const { data, width } = img;
 const x0 = Math.max(0, Math.floor(box.x0)), x1 = Math.min(width, Math.ceil(box.x1));
 const y0 = Math.max(0, Math.floor(box.y0)), y1 = Math.min(img.height, Math.ceil(box.y1));
+if (x1 <= x0 || y1 <= y0) return null;
+const threshold = trimThreshold(img, x0, y0, x1, y1);
+const safePad = pad ?? Math.max(10, Math.round(Math.min(img.width, img.height) * 0.006));
 let minX = Infinity, minY = Infinity, maxX = -1, maxY = -1;
 for (let y = y0; y < y1; y++) {
 const row = y * width * 4;
 for (let x = x0; x < x1; x++) {
-if (isDark(data, row + x * 4)) {
+const i = row + x * 4;
+const luminance = (data[i] * 299 + data[i + 1] * 587 + data[i + 2] * 114) / 1000;
+if (luminance < threshold) {
 if (x < minX) minX = x; if (x > maxX) maxX = x;
 if (y < minY) minY = y; if (y > maxY) maxY = y;
 }
@@ -171,8 +192,8 @@ if (y < minY) minY = y; if (y > maxY) maxY = y;
 }
 if (maxX < 0) return null;
 return {
-x0: Math.max(x0, minX - pad), y0: Math.max(y0, minY - pad),
-x1: Math.min(x1, maxX + 1 + pad), y1: Math.min(y1, maxY + 1 + pad),
+x0: Math.max(x0, minX - safePad), y0: Math.max(y0, minY - safePad),
+x1: Math.min(x1, maxX + 1 + safePad), y1: Math.min(y1, maxY + 1 + safePad),
 };
 }
 /** 박스 안 잉크 비율 */
@@ -273,18 +294,26 @@ let current = null;
 for (const p of pages) {
 const yTop = p.height * (opts.top ?? 0.07);
 const yBot = p.height * (1 - (opts.bottom ?? 0.06));
+const guardX = Math.max(8, p.width * 0.008);
+const captureBounds = (ci) => {
+const col = p.columns[ci];
+const leftLimit = ci ? (p.columns[ci - 1].x1 + col.x0) / 2 : 0;
+const rightLimit = ci + 1 < p.columns.length ? (col.x1 + p.columns[ci + 1].x0) / 2 : p.width;
+return { x0: Math.max(leftLimit, col.x0 - guardX), x1: Math.min(rightLimit, col.x1 + guardX) };
+};
 p.columns.forEach((col, ci) => {
+const capture = captureBounds(ci);
 const list = byPageCol.get(p.index + ':' + ci) || [];
 const firstY = list.length ? list[0].y0 : yBot;
 if (continuation && current && firstY - yTop > p.height * 0.02) {
-current.fragments.push({ page: p.index, x0: col.x0, y0: yTop, x1: col.x1, y1: firstY - 2, cont: true });
+current.fragments.push({ page: p.index, x0: capture.x0, y0: yTop, x1: capture.x1, y1: firstY - 2, cont: true });
 }
 list.forEach((a, k) => {
 const pad = Math.max(4, a.h * 0.35);
 const next = list[k + 1];
 current = {
 section: a.section, number: a.num,
-fragments: [{ page: p.index, x0: col.x0, y0: Math.max(yTop, a.y0 - pad), x1: col.x1, y1: next ? next.y0 - pad * 0.5 : yBot }],
+fragments: [{ page: p.index, x0: capture.x0, y0: Math.max(yTop, a.y0 - pad), x1: capture.x1, y1: next ? next.y0 - pad * 0.5 : yBot }],
 };
 items.push(current);
 });
@@ -547,14 +576,14 @@ const out = [];
 for (const f of fragments) {
 const pg = await cache.get(pageId(bookId, kind, f.page));
 if (!pg) continue;
-const t = trimBox(pg.imageData, f, 6);
+const t = trimBox(pg.imageData, f);
 if (!t) continue;
 if (f.cont && t.y1 - t.y0 < pg.canvas.height * 0.015) continue;
 out.push({ page: f.page, ...t, cont: !!f.cont });
 }
 return out;
 }
-/** 조각을 세로로 이어붙인 하나의 이미지(JPEG dataURL) */
+/** 조각을 원래 픽셀 비율 그대로 세로로 이어붙인 무손실 PNG */
 async function cropFragments(cache, bookId, kind, fragments) {
 const parts = [];
 for (const f of fragments) {
@@ -575,7 +604,7 @@ const fw = f.x1 - f.x0, fh = f.y1 - f.y0;
 ctx.drawImage(pg.canvas, f.x0, f.y0, fw, fh, 0, y, fw, fh);
 y += fh + gap;
 }
-return { image: c.toDataURL('image/jpeg', 0.9), w: c.width, h: c.height };
+return { image: c.toDataURL('image/png'), imageFormat: 'PNG', w: c.width, h: c.height };
 }
 /** 한글 텍스트를 이미지로 (jsPDF 한글 폰트 문제 회피) */
 function textImage(text, { size = 28, bold = false, color = '#111', maxWidth = 2000 } = {}) {
