@@ -60,6 +60,8 @@ button:disabled { opacity: .5; cursor: default; }
 .cl-main { flex: 1; min-width: 0; }
 .cl-group > summary { font-weight: 700; font-size: 15px; margin: 12px 0 6px; cursor: pointer; }
 .card select { width: 13em; max-width: 100%; }
+.toast { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); max-width: min(720px, 92vw); background: #b03a2e; color: #fff; padding: 10px 16px; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.25); font-size: 14px; z-index: 50; cursor: pointer; }
+.toast[hidden] { display: none; }
 .cl-group .more { margin: 8px 0; }
 @media (max-width: 900px) { .review, .classify { flex-direction: column; } .side, .facets { width: 100%; position: static; max-height: none; } .cols2 { grid-template-columns: 1fr; } }
 </style>
@@ -202,12 +204,14 @@ button:disabled { opacity: .5; cursor: default; }
 <h2>라이브러리</h2>
 <div id="lib-books"></div>
 <div class="toolbar">
-<button id="lib-export">전체 백업(JSON) 내보내기</button>
-<label class="btnlike">백업 가져오기 <input id="lib-import" type="file" accept="application/json" hidden /></label>
+<button id="lib-export">전체 백업 내보내기</button>
+<label class="btnlike">백업 가져오기 <input id="lib-import" type="file" accept=".jsonl,.json,application/json,application/x-ndjson" hidden /></label>
 </div>
 <p class="hint">모든 데이터는 이 브라우저의 IndexedDB에 저장됩니다. 브라우저 데이터를 지우면 사라지니 가끔 백업하세요.</p>
+<p id="lib-storage" class="hint"></p>
 </section>
 </main>
+<div id="toast" class="toast" role="alert" hidden></div>
 <script src="part1.js"></script>
 <script src="part2.js"></script>
 <script src="part3.js"></script>

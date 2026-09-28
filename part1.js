@@ -6,7 +6,7 @@ const DB_VERSION = 1;
 let dbPromise = null;
 function open() {
 if (dbPromise) return dbPromise;
-dbPromise = new Promise((resolve, reject) => {
+const p = new Promise((resolve, reject) => {
 const req = indexedDB.open(DB_NAME, DB_VERSION);
 req.onupgradeneeded = () => {
 const db = req.result;
@@ -20,10 +20,16 @@ const s = db.createObjectStore('items', { keyPath: 'id' });
 s.createIndex('bookId', 'bookId');
 }
 };
-req.onsuccess = () => resolve(req.result);
+req.onsuccess = () => {
+const db = req.result;
+db.onversionchange = () => { db.close(); dbPromise = null; }; // 다른 탭이 새 버전을 열면 연결을 넘겨준다
+resolve(db);
+};
 req.onerror = () => reject(req.error);
 });
-return dbPromise;
+dbPromise = p;
+p.catch(() => { if (dbPromise === p) dbPromise = null; }); // 열기에 실패하면 다음 호출에서 다시 시도
+return p;
 }
 function wrap(req) {
 return new Promise((resolve, reject) => {
@@ -31,46 +37,108 @@ req.onsuccess = () => resolve(req.result);
 req.onerror = () => reject(req.error);
 });
 }
-async function store(name, mode = 'readonly') {
-const db = await open();
-return db.transaction(name, mode).objectStore(name);
-}
-async function put(name, value) {
-return wrap((await store(name, 'readwrite')).put(value));
-}
-/** 한 트랜잭션 안에서 읽고 고쳐 쓴다 (동시에 저장하는 다른 작업의 변경을 덮어쓰지 않음). 기록이 없으면 null */
-async function update(name, id, fn) {
-const db = await open();
+/** 트랜잭션이 실제로 저장(commit)되면 끝난다. 용량 초과 등으로 취소되면 실패한다 */
+function done(t) {
 return new Promise((resolve, reject) => {
-const tx = db.transaction(name, 'readwrite');
-const s = tx.objectStore(name);
+t.oncomplete = () => resolve();
+t.onabort = () => reject(t.error || new DOMException('저장이 취소되었습니다.', 'AbortError'));
+t.onerror = (ev) => reject(ev?.target?.error || t.error || new Error('저장 실패'));
+});
+}
+async function write(names, fn) {
+const db = await open();
+const t = db.transaction(names, 'readwrite');
+let failure = null;
+const fail = (e) => { failure = failure || e; try { t.abort(); } catch { /* 이미 끝남 */ } };
+try { fn(t, fail); } catch (e) { fail(e); }
+try { await done(t); } catch (e) { throw failure || e; }
+if (failure) throw failure;
+}
+async function store(name) {
+const db = await open();
+return db.transaction(name, 'readonly').objectStore(name);
+}
+function put(name, value) {
+return write(name, (t) => { t.objectStore(name).put(value); });
+}
+function putMany(name, values) {
+return write(name, (t) => { const s = t.objectStore(name); for (const v of values) s.put(v); });
+}
+function del(name, id) {
+return write(name, (t) => { t.objectStore(name).delete(id); });
+}
+/** 한 트랜잭션 안에서 다시 읽고 고쳐 쓴다 (동시에 저장하는 다른 작업의 변경을 덮어쓰지 않음). 기록이 없으면 null */
+async function update(name, id, fn) {
 let result = null;
+await write(name, (t, fail) => {
+const s = t.objectStore(name);
 const req = s.get(id);
 req.onsuccess = () => {
 if (!req.result) return;
-result = fn(req.result) || req.result;
-s.put(result);
+try { result = fn(req.result) || req.result; s.put(result); } catch (e) { fail(e); }
 };
-tx.oncomplete = () => resolve(result);
-tx.onerror = () => reject(tx.error);
-tx.onabort = () => reject(tx.error);
+});
+return result;
+}
+/** 여러 기록을 한 트랜잭션에서 각각 다시 읽어 고쳐 쓴다. 없는 기록은 건너뛴다. 반환: 고친 개수 */
+async function updateMany(name, ids, fn) {
+let n = 0;
+await write(name, (t, fail) => {
+const s = t.objectStore(name);
+for (const id of ids) {
+const req = s.get(id);
+req.onsuccess = () => {
+if (!req.result) return;
+try { s.put(fn(req.result) || req.result); n++; } catch (e) { fail(e); }
+};
+}
+});
+return n;
+}
+/**
+* 한 책의 한 종류(문제/해설) 항목을 한 번에 바꾼다. 중간에 실패하면 기존 항목이 그대로 남는다.
+* 이미지를 읽지 않도록 키만 본다: 항목 id는 종류 첫 글자(p/s)로 시작하고, knownIds로 알려 준 id도 지운다.
+*/
+function replaceItems(bookId, kind, items, knownIds = []) {
+return write('items', (t, fail) => {
+const s = t.objectStore('items');
+const req = s.index('bookId').getAllKeys(bookId);
+req.onsuccess = () => {
+try {
+const drop = new Set(knownIds);
+for (const key of req.result) if (String(key).startsWith(kind[0])) drop.add(key);
+for (const key of drop) s.delete(key);
+for (const it of items) s.put(it);
+} catch (e) { fail(e); }
+};
 });
 }
-async function putMany(name, values) {
+/** 책의 문제·해설 개수 (이미지를 읽지 않고 키만 센다) */
+async function kindCounts(bookId) {
+const keys = await wrap((await store('items')).index('bookId').getAllKeys(bookId));
+const c = { problem: 0, solution: 0 };
+for (const k of keys) { const s = String(k); if (s.startsWith('p')) c.problem++; else if (s.startsWith('s')) c.solution++; }
+return c;
+}
+/** 기록을 하나씩 읽어 fn에 넘긴다 (전체를 한꺼번에 메모리에 올리지 않음). fn은 동기 함수여야 한다 */
+async function forEach(name, fn) {
 const db = await open();
-const tx = db.transaction(name, 'readwrite');
-const s = tx.objectStore(name);
-for (const v of values) s.put(v);
 return new Promise((resolve, reject) => {
-tx.oncomplete = () => resolve();
-tx.onerror = () => reject(tx.error);
+const t = db.transaction(name, 'readonly');
+const req = t.objectStore(name).openCursor();
+req.onsuccess = () => {
+const c = req.result;
+if (!c) return;
+try { fn(c.value); } catch (e) { reject(e); try { t.abort(); } catch { /* 이미 끝남 */ } return; }
+c.continue();
+};
+t.oncomplete = () => resolve();
+t.onerror = () => reject(t.error);
+t.onabort = () => reject(t.error || new Error('읽기가 취소되었습니다.'));
 });
 }
 async function get(name, id) {
 return wrap((await store(name)).get(id));
-}
-async function del(name, id) {
-return wrap((await store(name, 'readwrite')).delete(id));
 }
 async function all(name) {
 return wrap((await store(name)).getAll());
@@ -78,20 +146,25 @@ return wrap((await store(name)).getAll());
 async function byBook(name, bookId) {
 return wrap((await store(name)).index('bookId').getAll(bookId));
 }
-async function deleteBook(bookId) {
+/** 책과 그 페이지·항목을 한 트랜잭션으로 지운다 (이미지를 메모리로 읽지 않음) */
+function deleteBook(bookId) {
+return write(['books', 'pages', 'items'], (t, fail) => {
 for (const name of ['pages', 'items']) {
-const rows = await byBook(name, bookId);
-const db = await open();
-const tx = db.transaction(name, 'readwrite');
-for (const r of rows) tx.objectStore(name).delete(r.id);
-await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
+const s = t.objectStore(name);
+const req = s.index('bookId').getAllKeys(bookId);
+req.onsuccess = () => { try { for (const key of req.result) s.delete(key); } catch (e) { fail(e); } };
 }
-await del('books', bookId);
+t.objectStore('books').delete(bookId);
+});
 }
 function uid(prefix = '') {
 return prefix + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
-return { put, update, putMany, get, del, all, byBook, deleteBook, uid };
+/** 저장 공간 부족 오류인지 */
+function isQuotaError(e) {
+return !!e && (e.name === 'QuotaExceededError' || /quota/i.test(String(e.message || '')));
+}
+return { put, update, updateMany, replaceItems, putMany, get, del, all, byBook, forEach, kindCounts, deleteBook, uid, isQuotaError };
 })();
 M.layout = (() => {
 const DARK = 170; // 이 밝기보다 어두우면 '잉크'
@@ -147,7 +220,8 @@ while (e < W && !blank[e]) e++;
 if (e - x <= maxLine && e < W && blank[e]) {
 let peak = 0;
 for (let k = x; k < e; k++) peak = Math.max(peak, counts[k]);
-if (peak > rows * 0.5) for (let k = x; k < e; k++) blank[k] = 1;
+// 가는 세로 구분선: 점선·일부 구간만 있는 선(쪽 높이의 20% 이상)도 여백으로 본다
+if (peak > rows * 0.2) for (let k = x; k < e; k++) blank[k] = 1;
 }
 x = e;
 }
@@ -226,14 +300,20 @@ return { columnProfile, rowProfile, detectColumns, trimBox, inkRatio };
 })();
 M.segment = (() => {
 const NUM_WORD = /^[\[(【<]?(?:No\.?|#)?0*(\d{1,4})[\])】>.]?$/i;
-const NUM_LINE = /^[\[(【<]?(?:No\.?|#)?0*(\d{1,4})[\])】>.]?(?:\s|$)/i;
+// "1. 다음", "1.다음"(띄어쓰기 없음) 모두 인정. "1.5배" 같은 소수는 제외
+const NUM_LINE = /^[\[(【<]?(?:No\.?|#)?0*(\d{1,4})(?:[\])】>.](?!\d)|(?=\s|$))/i;
 function parseAnchorNumber(line) {
+return parseAnchor(line)?.num ?? null;
+}
+/** 번호와 표기 방식. "(1)"·"1)"처럼 괄호로 쓴 번호는 소문항일 때가 많아 따로 구분한다 */
+function parseAnchor(line) {
 const fw = line.firstWord?.text?.trim() ?? '';
 let m = fw.match(NUM_WORD);
 if (!m) m = line.text.trim().match(NUM_LINE);
 if (!m) return null;
 const n = parseInt(m[1], 10);
-return n >= 1 && n <= 9999 ? n : null;
+if (!(n >= 1 && n <= 9999)) return null;
+return { num: n, style: /[()]/.test(m[0]) ? 'paren' : 'plain' };
 }
 /** 페이지 한 장에서 번호 후보 수집 */
 function findCandidates(page, opts = {}) {
@@ -248,9 +328,9 @@ const fw = ln.firstWord || ln;
 if (ln.y1 < yTop || ln.y0 > yBot) continue;
 if (fw.x0 < col.x0 - cw * 0.03 || fw.x0 >= col.x1) continue;
 if (fw.x0 - col.x0 > cw * leftTol + 4) continue;
-const num = parseAnchorNumber(ln);
-if (num == null) continue;
-out.push({ page: page.index, col: ci, num, x0: fw.x0, y0: Math.min(fw.y0, ln.y0), y1: ln.y1, h: ln.y1 - ln.y0 });
+const anchor = parseAnchor(ln);
+if (!anchor) continue;
+out.push({ page: page.index, col: ci, num: anchor.num, style: anchor.style, x0: fw.x0, y0: Math.min(fw.y0, ln.y0), y1: ln.y1, h: ln.y1 - ln.y0 });
 }
 });
 return out;
@@ -269,6 +349,8 @@ const isReset = new Uint8Array(n);
 for (let i = 0; i < n; i++) {
 score[i] = 1 - Math.min(cands[i].num - 1, 50) * 0.02;
 for (let j = Math.max(0, i - 400); j < i; j++) {
+// 표기가 다른 번호끼리는 잇지 않는다 (본 문제 "5." 사이에 끼어든 소문항 "(1)(2)" 무시)
+if ((cands[i].style || 'plain') !== (cands[j].style || 'plain')) continue;
 const d = cands[i].num - cands[j].num;
 let s = -Infinity, reset = 0;
 if (d >= 1 && d <= maxSkip) s = score[j] + 1 - (d - 1) * 0.3;
@@ -291,6 +373,7 @@ return { ...cands[i], section };
 * 전체 분리. pages: [{index, width, height, columns:[{x0,x1}], lines:[...]}]
 * 반환: [{section, number, fragments:[{page,x0,y0,x1,y1}]}]  (자르기 전 원시 영역 — 호출측에서 trim)
 */
+const MAX_CONT_FRAGMENTS = 6;
 function segmentPages(pages, opts = {}) {
 const continuation = opts.continuation ?? false;
 const cands = [];
@@ -323,7 +406,8 @@ p.columns.forEach((col, ci) => {
 const capture = captureBounds(ci);
 const list = byPageCol.get(p.index + ':' + ci) || [];
 const firstY = list.length ? list[0].y0 : yBot;
-if (continuation && current && firstY - yTop > p.height * 0.02) {
+// 번호를 못 찾은 쪽이 계속되면 한 해설이 끝없이 길어지므로 이어붙이는 조각 수를 제한한다
+if (continuation && current && firstY - yTop > p.height * 0.02 && current.fragments.length < MAX_CONT_FRAGMENTS) {
 current.fragments.push({ page: p.index, x0: capture.x0, y0: yTop, x1: capture.x1, y1: firstY - 2, cont: true });
 }
 list.forEach((a, k) => {
@@ -360,19 +444,30 @@ function matchSolutions(problems, solutions) {
 const byKey = new Map(solutions.map((s) => [itemKey(s), s]));
 const byNum = new Map();
 for (const s of solutions) byNum.set(s.number, byNum.has(s.number) ? null : s);
+// 번호만으로 잇는 것은 문제 쪽에서도 그 번호가 하나뿐일 때만 (여러 단원의 같은 번호를 한 해설에 잇지 않도록)
+const probCount = new Map();
+for (const p of problems) probCount.set(p.number, (probCount.get(p.number) || 0) + 1);
 let matched = 0;
 for (const p of problems) {
-const s = byKey.get(itemKey(p)) || byNum.get(p.number) || null;
+const s = byKey.get(itemKey(p)) || (probCount.get(p.number) === 1 ? byNum.get(p.number) : null) || null;
 p.solutionId = s ? s.id : null;
 if (s) matched++;
 }
 return matched;
 }
-/** 해설 텍스트에서 정답 추출 (예: "정답 ③", "답: 12") */
+/**
+* 해설 텍스트에서 정답 추출. "정답 ③", "[정답] ③", "정답은 ③", "답: 12", "해답 ③", "정답 -3", "정답 1/2"
+* "해답 1. …"처럼 번호가 붙은 제목·"정답률"은 무시하고, "2√3"처럼 일부만 읽힐 답은 틀린 값 대신 null
+*/
+const ANSWER_RE = /(정답|해답|답)\s*[\]】)]?\s*(?:은|는|[:：])?\s*([①②③④⑤]|[-−]?\d{1,4}(?:\.\d+)?(?:\s*\/\s*\d{1,4})?)(?![\d√\/^]|\.\d)/g;
 function extractAnswer(text) {
 if (!text) return null;
-const m = text.match(/(?:정답|답)\s*[:：]?\s*([①②③④⑤]|\d{1,4}(?:\.\d+)?)/);
-return m ? m[1] : null;
+const s = String(text);
+for (const m of s.matchAll(ANSWER_RE)) {
+if (m[1] === '해답' && /^\s*\d+\s*[.)]/.test(s.slice(m.index + 2))) continue; // "해답 1. 풀이" 같은 제목
+return m[2].replace('−', '-').replace(/\s+/g, '');
+}
+return null;
 }
 /** 문제 텍스트에서 배점 추출 */
 function extractPoints(text) {
@@ -381,7 +476,7 @@ if (!text) return null;
 const m = text.match(/[\[(【]\s*([2-4])\s*점\s*[\])】]/) || text.match(/(?:^|[^\d.])([2-4])\s*점\s*$/m);
 return m ? parseInt(m[1], 10) : null;
 }
-return { parseAnchorNumber, findCandidates, chainAnchors, segmentPages, textInFragments, itemKey, matchSolutions, extractAnswer, extractPoints };
+return { parseAnchorNumber, parseAnchor, findCandidates, chainAnchors, segmentPages, textInFragments, itemKey, matchSolutions, extractAnswer, extractPoints };
 })();
 M.grade = (() => {
 const BOOK_LEVELS = {
@@ -766,6 +861,9 @@ if (effectiveGrade(p) == null || !p.image) return false;
 if (opts.requireSolution && !p.solutionId) return false;
 if (opts.bookIds?.length && !opts.bookIds.includes(p.bookId)) return false;
 if (opts.subjects?.length && !opts.subjects.includes(p.subject)) return false;
+// 끈 것만 빼는 방식: 새로 생긴 책·과목·유형은 기본으로 포함되고, 모두 끄면 아무것도 고르지 않는다
+if (opts.excludeBookIds?.includes(p.bookId)) return false;
+if (opts.excludeSubjects?.includes(p.subject)) return false;
 if (opts.excludeTypes?.length && opts.excludeTypes.includes(p.type)) return false;
 return true;
 });
@@ -830,7 +928,8 @@ function loadImage(src) {
 return new Promise((resolve, reject) => {
 const im = new Image();
 im.onload = () => resolve(im);
-im.onerror = reject;
+// 브라우저는 Event 객체만 주므로 알아볼 수 있는 오류로 바꾼다
+im.onerror = () => reject(new Error('저장된 이미지를 열 수 없습니다 (페이지 이미지가 손상되었을 수 있습니다).'));
 im.src = src;
 });
 }
@@ -883,27 +982,36 @@ if (!parts.length) return null;
 const gap = 8;
 const w = Math.max(...parts.map((p) => p.f.x1 - p.f.x0));
 const h = parts.reduce((s, p) => s + (p.f.y1 - p.f.y0), 0) + gap * (parts.length - 1);
+// 브라우저 캔버스 한계(한 변 약 32,767px, 넓이 약 1,600만px)를 넘으면 비율을 지킨 채 줄인다
+const k = Math.min(1, MAX_CANVAS_SIDE / Math.max(w, h), Math.sqrt(MAX_CANVAS_AREA / Math.max(1, w * h)));
 const c = document.createElement('canvas');
-c.width = Math.max(1, Math.round(w)); c.height = Math.max(1, Math.round(h));
+c.width = Math.max(1, Math.round(w * k)); c.height = Math.max(1, Math.round(h * k));
 const ctx = c.getContext('2d');
+if (!ctx) throw new Error('문제 이미지가 너무 커서 만들 수 없습니다.');
 ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+if (k < 1) { ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high'; }
 let y = 0;
 for (const { pg, f } of parts) {
 const fw = f.x1 - f.x0, fh = f.y1 - f.y0;
-ctx.drawImage(pg.canvas, f.x0, f.y0, fw, fh, 0, y, fw, fh);
+ctx.drawImage(pg.canvas, f.x0, f.y0, fw, fh, 0, y * k, fw * k, fh * k);
 y += fh + gap;
 }
-return { image: c.toDataURL('image/png'), imageFormat: 'PNG', w: c.width, h: c.height };
+// sizeFactor: 줄인 비율. PDF에 넣을 때 실제 크기를 되살리는 데 쓴다
+return { image: c.toDataURL('image/png'), imageFormat: 'PNG', w: c.width, h: c.height, sizeFactor: k };
 }
+const MAX_CANVAS_SIDE = 16000, MAX_CANVAS_AREA = 16e6;
 /** 한글 텍스트를 이미지로 (jsPDF 한글 폰트 문제 회피) */
 function textImage(text, { size = 28, bold = false, color = '#111', maxWidth = 2000 } = {}) {
 const c = document.createElement('canvas');
 const ctx = c.getContext('2d');
-const font = `${bold ? '700 ' : ''}${size}px "Noto Sans KR","Malgun Gothic","Apple SD Gothic Neo",sans-serif`;
-ctx.font = font;
-const w = Math.min(maxWidth, Math.ceil(ctx.measureText(text).width) + 4);
-c.width = Math.max(1, w); c.height = Math.ceil(size * 1.4);
-ctx.font = font; ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+const fontOf = (px) => `${bold ? '700 ' : ''}${px}px "Noto Sans KR","Malgun Gothic","Apple SD Gothic Neo",sans-serif`;
+ctx.font = fontOf(size);
+const measured = Math.ceil(ctx.measureText(text).width) + 4;
+// 긴 제목은 잘리지 않도록 글자를 줄인다 (이미지 높이는 그대로)
+const px = measured > maxWidth ? Math.max(8, Math.floor(size * (maxWidth - 4) / (measured - 4))) : size;
+ctx.font = fontOf(px);
+c.width = Math.max(1, Math.min(maxWidth, Math.ceil(ctx.measureText(text).width) + 4)); c.height = Math.ceil(size * 1.4);
+ctx.font = fontOf(px); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
 ctx.fillStyle = color; ctx.textBaseline = 'middle';
 ctx.fillText(text, 2, c.height / 2);
 return { image: c.toDataURL('image/png'), w: c.width, h: c.height };
