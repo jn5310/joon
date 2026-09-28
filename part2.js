@@ -393,10 +393,18 @@ leftTol: 0.1,      // 번호가 단 왼쪽 끝에서 이 비율 안에 있어야
 maxSkip: 3,        // 번호 건너뛰기 허용 폭
 forceOcr: false,   // 텍스트가 있어도 OCR 강제
 };
-async function ingestPdf(book, kind, file, opts, log) {
+async function ingestPdf(book, kind, file, opts, log, control) {
 const doc = await openPdf(file);
 const metas = [];
+if (control) {
+control.activeKind = kind;
+control.acceptingStops = true;
+control.onStateChange?.();
+}
+try {
 for (let p = 1; p <= doc.numPages; p++) {
+// 이미 중지가 요청됐다면 새 페이지를 시작하지 않는다.
+if (control?.stopRequested) break;
 const { canvas, lines: textLines, hasText } = await renderPage(doc, p, opts.scale);
 let lines = textLines, ocr = false;
 if (!hasText || opts.forceOcr) {
@@ -412,8 +420,16 @@ const meta = { id: pageId(book.id, kind, p), bookId: book.id, kind, index: p, wi
 await db.put('pages', { ...meta, image: canvas.toDataURL('image/jpeg', 0.88) });
 metas.push(meta);
 canvas.width = canvas.height = 0; // 메모리 해제
+// 진행 중이던 페이지는 온전히 저장한 뒤에만 멈춘다.
+if (control?.stopRequested) break;
 }
-return metas;
+} finally {
+if (control) {
+control.acceptingStops = false;
+control.onStateChange?.();
+}
+}
+return { metas, totalPages: doc.numPages, stopped: !!control?.stopRequested };
 }
 /** 저장된 페이지 정보로 문제 분리를 다시 수행 (옵션 변경 시에도 사용) */
 async function segmentKind(book, kind, metas, log) {
@@ -473,24 +489,37 @@ if (!p.answerManual && !p.answerLLM) p.answer = s?.answer ?? null;
 await db.putMany('items', problems);
 return { problems: problems.length, solutions: solutions.length, matched };
 }
-async function ingestBook({ name, subject, level, problemFile, solutionFile, options }, log) {
+async function ingestBook({ name, subject, level, problemFile, solutionFile, options }, log, control) {
 const book = {
 id: db.uid('b'), name, subject, level,
 options: { ...DEFAULT_OPTIONS, ...options },
 createdAt: new Date().toISOString(),
+pageCounts: { problem: 0, solution: 0 },
+ingest: { status: 'processing', stoppedAt: null },
 };
 await db.put('books', book);
-book.pageCounts = { problem: 0, solution: 0 };
-const pm = await ingestPdf(book, 'problem', problemFile, book.options, log);
-book.pageCounts.problem = pm.length;
-await segmentKind(book, 'problem', pm, log);
-if (solutionFile) {
-const sm = await ingestPdf(book, 'solution', solutionFile, book.options, log);
-book.pageCounts.solution = sm.length;
-await segmentKind(book, 'solution', sm, log);
+
+const problemResult = await ingestPdf(book, 'problem', problemFile, book.options, log, control);
+book.pageCounts.problem = problemResult.metas.length;
+await db.put('books', book); // 후처리 실패 시에도 실제 수집 페이지 수를 보존
+await segmentKind(book, 'problem', problemResult.metas, log);
+
+let stoppedAt = problemResult.stopped ? {
+kind: 'problem', processedPages: problemResult.metas.length, totalPages: problemResult.totalPages,
+} : null;
+if (!stoppedAt && solutionFile) {
+const solutionResult = await ingestPdf(book, 'solution', solutionFile, book.options, log, control);
+book.pageCounts.solution = solutionResult.metas.length;
+await db.put('books', book);
+await segmentKind(book, 'solution', solutionResult.metas, log);
+if (solutionResult.stopped) stoppedAt = {
+kind: 'solution', processedPages: solutionResult.metas.length, totalPages: solutionResult.totalPages,
+};
 }
+
 const stats = await relink(book.id);
 book.stats = stats;
+book.ingest = { status: stoppedAt ? 'stopped' : 'complete', stoppedAt };
 await db.put('books', book);
 return book;
 }
