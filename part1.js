@@ -303,8 +303,7 @@ const cx = (ln.x0 + ln.x1) / 2, cy = (ln.y0 + ln.y1) / 2;
 if (cx >= f.x0 && cx <= f.x1 && cy >= f.y0 && cy <= f.y1) out.push(ln.text);
 }
 }
-return out.join('
-');
+return out.join('\n');
 }
 function itemKey(it) {
 return `${it.section}-${it.number}`;
@@ -331,7 +330,8 @@ return m ? m[1] : null;
 /** 문제 텍스트에서 배점 추출 */
 function extractPoints(text) {
 if (!text) return null;
-const m = text.match(/\[?\s*([2-4])\s*점\s*\]?/);
+// "[4점]" "(4점)" 형태를 우선, 없으면 줄 끝에 단독으로 있는 "4점" ("14점", "2.4점", "두 점" 등은 제외)
+const m = text.match(/[\[(【]\s*([2-4])\s*점\s*[\])】]/) || text.match(/(?:^|[^\d.])([2-4])\s*점\s*$/m);
 return m ? parseInt(m[1], 10) : null;
 }
 return { parseAnchorNumber, findCandidates, chainAnchors, segmentPages, textInFragments, itemKey, matchSolutions, extractAnswer, extractPoints };

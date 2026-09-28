@@ -276,22 +276,22 @@ async function buildPdf(entries, opts) {
 await loadScript(JSPDF_URL);
 const { jsPDF } = window.jspdf;
 const doc = new jsPDF({ unit: 'mm', format: 'a4', compress: true });
-const PW = 210, PH = 297, M = 14, GUT = 8;
+const PW = 210, PH = 297, MARGIN = 14, GUT = 8;
 const cols = opts.columns === 2 ? 2 : 1;
-const colW = (PW - 2 * M - (cols - 1) * GUT) / cols;
-const bottom = PH - M - 6;
+const colW = (PW - 2 * MARGIN - (cols - 1) * GUT) / cols;
+const bottom = PH - MARGIN - 6;
 const zoom = opts.zoom || 1;
-let pageNo = 1, col = 0, y = M, pageTop = M;
-const colX = (c) => M + c * (colW + GUT);
-const fullH = () => bottom - M;
+let pageNo = 1, col = 0, y = MARGIN, pageTop = MARGIN;
+const colX = (c) => MARGIN + c * (colW + GUT);
+const fullH = () => bottom - MARGIN;
 const decorate = () => {
 doc.setFontSize(9); doc.setTextColor(120);
-doc.text(String(pageNo), PW / 2, PH - M / 2, { align: 'center' });
+doc.text(String(pageNo), PW / 2, PH - MARGIN / 2, { align: 'center' });
 };
 const divider = () => {
 if (cols === 2) { doc.setDrawColor(200); doc.line(PW / 2, pageTop, PW / 2, bottom); }
 };
-const newPage = () => { divider(); doc.addPage(); pageNo++; col = 0; pageTop = M; y = M; decorate(); };
+const newPage = () => { divider(); doc.addPage(); pageNo++; col = 0; pageTop = MARGIN; y = MARGIN; decorate(); };
 const nextCol = () => { if (++col >= cols) newPage(); else y = pageTop; };
 const label = (text, size = 26, bold = true, color = '#1f3a93') => {
 const t = textImage(text, { size, bold, color });
@@ -328,15 +328,15 @@ y += 4;
 decorate();
 const t1 = textImage(opts.title || '나만의 문제집', { size: 56, bold: true });
 const th = 11;
-doc.addImage(t1.image, 'PNG', M, y, Math.min(PW - 2 * M, (t1.w / t1.h) * th), th);
+doc.addImage(t1.image, 'PNG', MARGIN, y, Math.min(PW - 2 * MARGIN, (t1.w / t1.h) * th), th);
 y += th + 1;
 if (opts.subtitle) {
 const t2 = textImage(opts.subtitle, { size: 30, color: '#555' });
 const sh = 6;
-doc.addImage(t2.image, 'PNG', M, y, Math.min(PW - 2 * M, (t2.w / t2.h) * sh), sh);
+doc.addImage(t2.image, 'PNG', MARGIN, y, Math.min(PW - 2 * MARGIN, (t2.w / t2.h) * sh), sh);
 y += sh + 2;
 }
-doc.setDrawColor(60); doc.setLineWidth(0.6); doc.line(M, y, PW - M, y); doc.setLineWidth(0.2);
+doc.setDrawColor(60); doc.setLineWidth(0.6); doc.line(MARGIN, y, PW - MARGIN, y); doc.setLineWidth(0.2);
 y += 4;
 pageTop = y; // 2단일 때 첫 페이지 오른쪽 단도 제목 아래부터
 const header = (i, e) => {
