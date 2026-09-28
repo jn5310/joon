@@ -34,12 +34,14 @@ s.replaceChildren(...books.map((b) => opt(b.id, b.name, b.id === cur)));
 renderLibrary();
 renderBuildFilters();
 }
-document.querySelectorAll('#tabs button').forEach((b) => b.addEventListener('click', () => {
-document.querySelectorAll('#tabs button').forEach((x) => x.classList.toggle('active', x === b));
-document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.id === 'tab-' + b.dataset.tab));
-if (b.dataset.tab === 'review') loadReview();
-if (b.dataset.tab === 'grade') renderHist();
-}));
+function activateTab(name) {
+const button = $(`#tabs button[data-tab="${name}"]`);
+document.querySelectorAll('#tabs button').forEach((x) => x.classList.toggle('active', x === button));
+document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.id === 'tab-' + name));
+if (name === 'review') loadReview();
+if (name === 'grade') renderHist();
+}
+document.querySelectorAll('#tabs button').forEach((b) => b.addEventListener('click', () => activateTab(b.dataset.tab)));
 $('#in-subject').append(opt('', '(미정)'), ...SUBJECTS.map((s) => opt(s, s)));
 $('#in-level').append(...Object.entries(BOOK_LEVELS).map(([k, v]) => opt(k, v.label)));
 function logTo(pre, bar) {
@@ -54,6 +56,15 @@ pre.scrollTop = pre.scrollHeight;
 if (frac != null) bar.style.width = Math.round(frac * 100) + '%';
 };
 }
+let ingestControl = null;
+$('#btn-ingest-stop').addEventListener('click', () => {
+if (!ingestControl?.acceptingStops || ingestControl.stopRequested) return;
+ingestControl.stopRequested = true;
+const stopBtn = $('#btn-ingest-stop');
+stopBtn.disabled = true;
+stopBtn.textContent = '중지 요청됨';
+ingestControl.log('중지 요청됨: 현재 처리 중인 페이지를 저장한 뒤, 완료된 페이지까지만 문제를 분리합니다.');
+});
 $('#btn-ingest').addEventListener('click', async () => {
 const problemFile = $('#in-problem').files[0];
 const solutionFile = $('#in-solution').files[0];
@@ -61,7 +72,20 @@ if (!problemFile) return alert('문제집 PDF를 선택하세요.');
 const name = $('#in-name').value.trim() || problemFile.name.replace(/\.pdf$/i, '');
 const log = logTo($('#ingest-log'), $('#ingest-bar'));
 const btn = $('#btn-ingest');
+const stopBtn = $('#btn-ingest-stop');
+ingestControl = {
+stopRequested: false,
+acceptingStops: false,
+log,
+onStateChange() {
+stopBtn.disabled = !this.acceptingStops || this.stopRequested;
+stopBtn.textContent = this.stopRequested
+? '중지 요청됨'
+: this.acceptingStops ? '현재 페이지까지만 처리하고 중지' : '분리·저장 중';
+},
+};
 btn.disabled = true;
+ingestControl.onStateChange();
 try {
 const book = await ingestBook({
 name, subject: $('#in-subject').value, level: $('#in-level').value, problemFile, solutionFile,
@@ -69,40 +93,70 @@ options: {
 scale: +$('#opt-scale').value, top: +$('#opt-top').value, bottom: +$('#opt-bottom').value,
 leftTol: +$('#opt-left').value, maxSkip: +$('#opt-skip').value, forceOcr: $('#opt-ocr').checked,
 },
-}, log);
+}, log, ingestControl);
 const s = book.stats;
+if (book.ingest?.status === 'stopped') {
+const at = book.ingest.stoppedAt;
+const label = at.kind === 'problem' ? '문제집' : '해설지';
+log(`부분 처리 완료: ${label} ${at.processedPages}/${at.totalPages}쪽 · 문제 ${s.problems}개, 해설 ${s.solutions}개, 연결 ${s.matched}개`, 1);
+} else {
 log(`완료: 문제 ${s.problems}개, 해설 ${s.solutions}개, 연결 ${s.matched}개`, 1);
+}
 await runHeuristic(book.id);
-log('규칙 기반 난이도 판정 완료. ② 검토·수정 탭에서 분리 결과를 확인하세요.');
 await refreshBooks();
 $('#rv-book').value = book.id;
+if (book.ingest?.status === 'stopped') {
+log('규칙 기반 난이도 판정 완료. 인식된 문제를 하나씩 확인할 수 있도록 검토 화면을 엽니다.');
+$('#rv-kind').value = 'problem';
+rv.page = 1;
+activateTab('review');
+} else {
+log('규칙 기반 난이도 판정 완료. ② 검토·수정 탭에서 분리 결과를 확인하세요.');
+}
 } catch (e) {
 console.error(e);
 log('오류: ' + e.message);
 } finally {
+ingestControl = null;
 btn.disabled = false;
+stopBtn.disabled = true;
+stopBtn.textContent = '현재 페이지까지만 처리하고 중지';
 }
 });
 const rv = { book: null, kind: 'problem', page: 1, items: [], rec: null, img: null, imageData: null, sel: null, drag: null, cache: new PageCache() };
 async function loadReview() {
 const id = $('#rv-book').value;
 rv.book = bookById(id);
-if (!rv.book) { $('#rv-side').textContent = '먼저 책을 추가하세요.'; return; }
+if (!rv.book) { $('#rv-status').textContent = ''; $('#rv-side').textContent = '먼저 책을 추가하세요.'; return; }
 rv.kind = $('#rv-kind').value;
+const stoppedAt = rv.book.ingest?.stoppedAt;
+$('#rv-status').textContent = stoppedAt
+? `부분 처리된 책입니다: ${stoppedAt.kind === 'problem' ? '문제집' : '해설지'} ${stoppedAt.processedPages}/${stoppedAt.totalPages}쪽까지 저장했습니다. 목록의 "보기"를 눌러 문제를 하나씩 확인하세요. 마지막 페이지의 항목은 다음 쪽에서 이어질 수 있습니다.`
+: '';
 rv.items = (await db.byBook('items', id)).filter((i) => i.kind === rv.kind);
 rv.items.sort((a, b) => (a.section - b.section) || (a.number - b.number));
 const n = rv.book.pageCounts?.[rv.kind] || 0;
 $('#rv-pages').textContent = n;
-rv.page = Math.min(Math.max(1, rv.page), Math.max(1, n));
+rv.page = n ? Math.min(Math.max(1, rv.page), n) : 0;
 rv.sel = null;
 await showPage();
 renderReviewList();
 }
 async function showPage() {
-$('#rv-page').value = rv.page;
-rv.rec = await db.get('pages', pageId(rv.book.id, rv.kind, rv.page));
+const n = rv.book?.pageCounts?.[rv.kind] || 0;
+$('#rv-page').value = rv.page || '';
+$('#rv-page').disabled = !n;
+$('#rv-prev').disabled = !n || rv.page <= 1;
+$('#rv-next').disabled = !n || rv.page >= n;
+rv.rec = rv.page ? await db.get('pages', pageId(rv.book.id, rv.kind, rv.page)) : null;
 const cv = $('#rv-canvas');
-if (!rv.rec) { cv.width = cv.height = 1; return; }
+if (!rv.rec) {
+rv.img = null; rv.imageData = null; rv.sel = null;
+cv.width = cv.height = 1;
+const ctx = cv.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, 1, 1);
+$('#rv-side').textContent = n ? '페이지를 불러오지 못했습니다.' : '저장된 페이지가 없습니다.';
+return;
+}
 rv.img = await loadImage(rv.rec.image);
 cv.width = rv.img.naturalWidth; cv.height = rv.img.naturalHeight;
 const ctx = cv.getContext('2d', { willReadFrequently: true });
@@ -443,7 +497,7 @@ const probs = mine.filter((i) => i.kind === 'problem');
 const graded = probs.filter((p) => effectiveGrade(p) != null).length;
 const ai = probs.filter((p) => p.gradeLLM != null).length;
 return el('div', { class: 'bookrow' },
-el('div', {}, el('b', {}, b.name), ' ', el('span', { class: 'hint' }, `${b.subject || '과목 미정'} · ${BOOK_LEVELS[b.level]?.label ?? ''}`), el('br'),
+el('div', {}, el('b', {}, b.name), ' ', b.ingest?.status === 'stopped' ? el('span', { class: 'badge warn' }, '부분 처리') : null, ' ', el('span', { class: 'hint' }, `${b.subject || '과목 미정'} · ${BOOK_LEVELS[b.level]?.label ?? ''}`), el('br'),
 `문제 ${probs.length} · 해설 ${mine.length - probs.length} · 해설 연결 ${probs.filter((p) => p.solutionId).length} · 난이도 ${graded} (AI ${ai})`),
 el('div', {},
 el('select', { onchange: async (ev) => { b.level = ev.target.value; await db.put('books', b); await runHeuristic(b.id); renderLibrary(); } },
