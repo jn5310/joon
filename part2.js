@@ -1,4 +1,4 @@
-// MathBook part2.js — 이 줄부터 끝까지 전부 복사
+// Math Finder part2.js — 이 줄부터 끝까지 전부 복사
 var M = window.M || (window.M = {});
 M.pdfsource = (() => {
 const PDFJS_VER = '4.10.38';

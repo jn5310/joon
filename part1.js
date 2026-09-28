@@ -1,4 +1,4 @@
-// MathBook part1.js — 이 줄부터 끝까지 전부 복사
+// Math Finder part1.js — 이 줄부터 끝까지 전부 복사
 var M = window.M || (window.M = {});
 M.db = (() => {
 const DB_NAME = 'mathbook';

@@ -1,4 +1,4 @@
-// MathBook part3.js — 이 줄부터 끝까지 전부 복사
+// Math Finder part3.js — 이 줄부터 끝까지 전부 복사
 var M = window.M || (window.M = {});
 M.app = (() => {
 const db = M.db;
@@ -509,7 +509,7 @@ el('button', { onclick: async () => { if (confirm(`"${b.name}"을(를) 삭제할
 $('#lib-export').addEventListener('click', async () => {
 const data = { version: 1, books: await db.all('books'), pages: await db.all('pages'), items: await db.all('items') };
 const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
-const a = el('a', { href: URL.createObjectURL(blob), download: `mathbook-backup-${new Date().toISOString().slice(0, 10)}.json` });
+const a = el('a', { href: URL.createObjectURL(blob), download: `math-finder-backup-${new Date().toISOString().slice(0, 10)}.json` });
 a.click();
 setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 });
