@@ -38,6 +38,24 @@ return db.transaction(name, mode).objectStore(name);
 async function put(name, value) {
 return wrap((await store(name, 'readwrite')).put(value));
 }
+/** 한 트랜잭션 안에서 읽고 고쳐 쓴다 (동시에 저장하는 다른 작업의 변경을 덮어쓰지 않음). 기록이 없으면 null */
+async function update(name, id, fn) {
+const db = await open();
+return new Promise((resolve, reject) => {
+const tx = db.transaction(name, 'readwrite');
+const s = tx.objectStore(name);
+let result = null;
+const req = s.get(id);
+req.onsuccess = () => {
+if (!req.result) return;
+result = fn(req.result) || req.result;
+s.put(result);
+};
+tx.oncomplete = () => resolve(result);
+tx.onerror = () => reject(tx.error);
+tx.onabort = () => reject(tx.error);
+});
+}
 async function putMany(name, values) {
 const db = await open();
 const tx = db.transaction(name, 'readwrite');
@@ -73,7 +91,7 @@ await del('books', bookId);
 function uid(prefix = '') {
 return prefix + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
-return { put, putMany, get, del, all, byBook, deleteBook, uid };
+return { put, update, putMany, get, del, all, byBook, deleteBook, uid };
 })();
 M.layout = (() => {
 const DARK = 170; // 이 밝기보다 어두우면 '잉크'
@@ -447,6 +465,276 @@ return '-';
 }
 return { BOOK_LEVELS, keywordCount, features, heuristicGrades, effectiveGrade, gradeSource };
 })();
+M.classify = (() => {
+const UNCLASSIFIED = '미분류';
+const AREAS = ['공통수학', '대수·수학I', '수학II·미적분', '확률과 통계', '기하'];
+const asciiLower = (s) => s.replace(/[A-Z]/g, (c) => c.toLowerCase());
+/**
+* 비교용 텍스트: 전각·첨자 통일, "실수 전체의 집합" 같은 관용구 제거.
+* raw는 띄어쓰기를 지킨 글(짧은 낱말용), flat은 공백을 모두 지운 글(인식 과정의 띄어쓰기 잡음에 강함)
+*/
+function prepare(text) {
+const raw = String(text || '').normalize('NFKC').replace(/[′’`]/g, "'").replace(/[−–]/g, '-').replace(/->|⟶|➝/g, '→')
+.replace(/\s+/g, ' ').replace(/(실수|자연수|정수|유리수|양의 ?실수|음이 ?아닌 ?정수) ?전체의 ?집합/g, ' ');
+const flat = raw.replace(/\s+/g, '');
+// flat에서 낱말이 시작하는 위치 (raw의 공백 바로 다음 글자)
+const starts = new Set();
+for (let ri = 0, fi = 0; ri < raw.length; ri++) {
+if (raw[ri] === ' ') continue;
+if (ri === 0 || raw[ri - 1] === ' ') starts.add(fi);
+fi++;
+}
+return { raw, flat, lower: asciiLower(flat), rawLower: asciiLower(raw), starts };
+}
+/**
+* 한 낱말 키워드: 낱말 안에서 찾거나("등차수열" ⊃ "수열"), 띄어 쓴 형태("평균 변화율", 줄바꿈된 "변곡\n점")는
+* 낱말 첫머리에서 시작할 때만 인정한다. 그래서 "…이므로 그 함수"(로그함수)·"주어진 수"(진수)처럼
+* 앞 낱말 끝에서 시작하는 우연한 일치는 걸러진다. 여러 낱말로 된 구절은 공백을 지운 글에서 찾는다.
+*/
+const word = (text, w) => {
+const key = prepare(text).lower;
+if (/\s/.test(text)) return { label: text, w, test: (t) => t.lower.includes(key) };
+return {
+label: text, w,
+test: (t) => {
+if (t.rawLower.includes(key)) return true;
+for (let i = t.lower.indexOf(key); i >= 0; i = t.lower.indexOf(key, i + 1)) if (t.starts.has(i)) return true;
+return false;
+},
+};
+};
+const pattern = (re, w, label, field = 'flat') => ({ label, w, test: (t) => re.test(t[field]) });
+/** 초월함수(지수·로그·삼각함수) 근거가 있어야 성립하는 규칙. 수학II 계열 책에서는 인식 잡음으로 보고 쓰지 않는다 */
+const trans = (rule) => ({ ...rule, trans: true });
+const combo = (label, w, ...tests) => trans({ label, w, test: (t) => tests.every((f) => f(t)) });
+const LN = /(^|[^a-z])ln(?=[\s(x]|$)/i;
+const isTrans = (t) => /sin|cos|tan|log|e\^|지수함수|삼각함수/i.test(t.flat) || /(^|[^프블])로그/.test(t.raw) || LN.test(t.raw);
+// 함수 이름은 소문자(f'(x)), 점·집합 이름은 대문자(A'(a, b), X → X)이므로 대소문자를 구분한다
+const isDiff = (t) => /미분|도함수|접선|극[대소]|극[댓솟]값/.test(t.raw) || /[a-z]'\(/.test(t.flat);
+const isInteg = (t) => /적분|∫/.test(t.raw);
+/** 한국 고등학교 수학 단원 기준 유형. 같은 점수면 앞에 있는 유형이 우선한다. */
+const TYPES = [
+{ label: '다항식', area: '공통수학', rules: [
+word('다항식', 2), word('나머지정리', 3), word('인수정리', 3), word('조립제법', 3), word('항등식', 2), word('인수분해', 2),
+word('나누었을 때의 나머지', 3), word('나눈 나머지', 3), word('곱셈 공식', 2), word('몫', 1)] },
+{ label: '방정식과 부등식', area: '공통수학', rules: [
+word('복소수', 3), word('허수', 2), word('켤레', 2), word('판별식', 3), word('근과 계수', 3), word('이차 방정식', 2),
+word('삼차 방정식', 2), word('사차 방정식', 2), word('연립 방정식', 2), word('연립 부등식', 2), word('이차 부등식', 2),
+word('허근', 2), word('실근', 1), word('중근', 1), word('이차함수', 1), word('부등식', 1)] },
+{ label: '행렬', area: '공통수학', rules: [word('행렬', 3), word('단위행렬', 2), word('역행렬', 2)] },
+{ label: '도형의 방정식', area: '공통수학', rules: [
+word('좌표평면', 1), word('두 점 사이의 거리', 3), word('내분', 2), word('외분', 2), word('직선의 방정식', 3), word('원의 방정식', 3),
+word('원의 중심', 2), word('반지름', 1), word('기울기', 1), word('평행이동', 2), word('대칭이동', 2), word('수직이등분선', 2),
+word('점과 직선 사이의 거리', 3), pattern(/x\^?2\+y\^?2/i, 1.5, 'x²+y²')] },
+{ label: '집합과 명제', area: '공통수학', rules: [
+word('집합', 2), word('원소', 1), word('부분집합', 2), word('교집합', 2), word('합집합', 2), word('여집합', 2), word('차집합', 2),
+word('명제', 3), word('필요조건', 3), word('충분조건', 3), word('필요충분', 2), word('진리집합', 2), word('대우', 2),
+word('절대부등식', 3), word('산술평균', 2), word('기하평균', 2), pattern(/[∈∉⊂⊄⊆⊇]/, 2, '집합 기호')] },
+{ label: '함수와 그래프', area: '공통수학', rules: [
+word('합성함수', 3), word('역함수', 3), word('일대일대응', 3), word('일대일 함수', 3), word('항등함수', 2), word('상수함수', 1),
+word('정의역', 1), word('치역', 2), word('공역', 2), word('유리함수', 3), word('무리함수', 3), word('분수함수', 2), word('점근선', 1),
+pattern(/∘/, 2, 'f∘g')] },
+{ label: '지수와 로그', area: '대수·수학I', rules: [
+word('거듭제곱근', 3), word('지수법칙', 3), word('제곱근', 1), word('세제곱근', 2), pattern(/(^|[^프블])로그/, 2, '로그', 'raw'),
+pattern(/log/i, 2, 'log'), word('진수', 2), word('상용로그', 3), word('지표', 1), word('가수', 1)] },
+{ label: '지수함수와 로그함수', area: '대수·수학I', rules: [
+word('지수 함수', 3), word('로그함수', 3), word('지수 방정식', 3), word('로그방정식', 3), word('지수 부등식', 3), word('로그부등식', 3),
+pattern(/(^|[^가-힣])로그 (함수|방정식|부등식)/, 3, '로그 함수', 'raw'),
+pattern(/y=log/i, 3, 'y=log'), pattern(/y=\(?\d+(\/\d+)?\)?\^x/i, 2, 'y=aˣ'), word('점근선', 1)] },
+{ label: '삼각함수', area: '대수·수학I', rules: [
+word('삼각 함수', 3), pattern(/sin|cos|tan/i, 3, 'sin·cos·tan'), word('사인법칙', 3), word('코사인법칙', 3), word('라디안', 3),
+word('호도법', 3), word('부채꼴', 2), word('일반각', 3), word('동경', 2), word('주기', 1)] },
+{ label: '수열', area: '대수·수학I', rules: [
+word('수열', 3), word('등차', 2), word('등비', 2), word('공차', 3), word('공비', 3), word('첫째항', 3), word('일반항', 2),
+pattern(/[Σ∑]/, 3, 'Σ'), word('시그마', 3), word('수학적 귀납법', 3), word('귀납', 1), word('점화식', 3), word('계차', 3),
+pattern(/(^|[^a-z])a_?[({]?n\+1/i, 2, 'aₙ₊₁'), pattern(/(^|[^a-z])a_?[({]?n([^a-z+]|$)/i, 1, 'aₙ')] },
+{ label: '함수의 극한과 연속', area: '수학II·미적분', rules: [
+word('함수의 극한', 3), word('극한값', 2), pattern(/lim/i, 1, 'lim'), pattern(/x→/, 2, 'x→'), word('좌극한', 3), word('우극한', 3),
+word('연속', 1), word('불연속', 2), word('사잇값', 3), word('최대·최소 정리', 2)] },
+{ label: '다항함수의 미분', area: '수학II·미적분', rules: [
+word('미분', 2), word('미분계수', 2), word('평균변화율', 3), word('순간변화율', 3), word('도함수', 3), pattern(/[a-z]'\(/, 3, "f'(x)"),
+word('미분가능', 1), word('접선의 방정식', 2), word('접선의 기울기', 2), word('극대', 2), word('극소', 2), word('극값', 2),
+word('극댓값', 2), word('극솟값', 2), word('증가', 1), word('감소', 1), word('가속도', 1), word('속도', 1),
+word('삼차함수', 1), word('사차함수', 1), word('다항함수', 1), word('최댓값', 0.5), word('최솟값', 0.5)] },
+{ label: '다항함수의 적분', area: '수학II·미적분', rules: [
+word('적분', 2), word('부정적분', 2), word('정적분', 2), pattern(/∫/, 3, '∫'), word('넓이', 1), word('둘러싸인', 2),
+word('움직인 거리', 2), word('원시함수', 3), word('적분상수', 2)] },
+{ label: '수열의 극한', area: '수학II·미적분', rules: [
+word('수열의 극한', 4), word('급수', 3), word('등비급수', 2), word('무한등비', 3), pattern(/n→∞/i, 4, 'n→∞'), pattern(/limn/i, 3, 'lim n'),
+word('수렴', 1), word('발산', 1)] },
+{ label: '여러 가지 함수의 미분', area: '수학II·미적분', rules: [
+word('자연로그', 2), trans(pattern(LN, 3, 'ln', 'raw')), trans(pattern(/(^|[^a-z])e\s?\^?\s?x([^a-z]|$)/i, 1.5, 'eˣ', 'raw')),
+word('몫의 미분', 4), word('합성함수의 미분', 4), word('역함수의 미분', 4), word('음함수', 3), word('매개변수', 3),
+word('이계도함수', 3), word('변곡점', 3), word('오목', 2), word('볼록', 2), word('속력', 1), combo('미분 + 초월함수', 3, isDiff, isTrans)] },
+{ label: '여러 가지 함수의 적분', area: '수학II·미적분', rules: [
+word('치환적분', 4), word('부분적분', 4), word('구분구적', 3), word('부피', 2), word('입체도형', 1), combo('적분 + 초월함수', 3, isInteg, isTrans)] },
+{ label: '경우의 수', area: '확률과 통계', rules: [
+word('경우의 수', 3), word('순열', 3), word('조합', 2), word('중복조합', 2), word('원순열', 2), word('이항정리', 3), word('이항계수', 3),
+word('파스칼', 2), word('방법의 수', 3), word('일렬로', 2), word('나열', 1), word('택하는', 1), word('뽑는', 1), word('선택하는', 1)] },
+{ label: '확률', area: '확률과 통계', rules: [
+pattern(/확률(?!변수|분포|밀도)/, 3, '확률'), word('조건부확률', 2), word('독립', 2), word('종속', 2), word('여사건', 3), word('배반', 3),
+word('시행', 1), word('사건', 1), pattern(/P\([A-WYZ](\)|[∩∪|]|\^?c)/, 2, 'P(A)'), word('주사위', 1), word('동전', 1), word('꺼낼 때', 1)] },
+{ label: '통계', area: '확률과 통계', rules: [
+word('확률 변수', 3), word('확률 분포', 3), word('기댓값', 3), word('평균', 1), word('분산', 3), word('표준 편차', 3), word('이항 분포', 3),
+word('정규 분포', 3), word('표본', 2), word('모평균', 3), word('모표준편차', 3), word('신뢰 구간', 3), word('신뢰도', 2), word('확률 밀도', 3),
+pattern(/[EVσ]\(X\)|P\(X[=<>≤≥]/, 3, 'E(X)·P(X=…)')] },
+{ label: '이차곡선', area: '기하', rules: [
+word('이차곡선', 3), word('포물선', 2), word('타원', 3), word('쌍곡선', 3), word('초점', 2), word('준선', 3), word('장축', 3),
+word('단축', 3), word('주축', 3), word('점근선', 1)] },
+{ label: '평면벡터', area: '기하', rules: [
+word('벡터', 3), word('내적', 3), word('위치벡터', 2), word('단위벡터', 2), word('영벡터', 2), word('방향벡터', 1), word('법선벡터', 1)] },
+{ label: '공간도형과 공간좌표', area: '기하', rules: [
+word('정사영', 3), word('이면각', 3), word('삼수선', 3), word('공간좌표', 3), word('좌표공간', 3), word('구의 방정식', 3),
+word('꼬인 위치', 3), pattern(/평면[αβγ]/, 2, '평면 α'), word('xy평면', 3), word('yz평면', 3), word('zx평면', 3), word('사면체', 2),
+word('정육면체', 1), word('직육면체', 1), word('수선의 발', 1), pattern(/z축/i, 2, 'z축')] },
+];
+const TYPE_INDEX = new Map(TYPES.map((t, i) => [t.label, i]));
+const POLY_DIFF = TYPE_INDEX.get('다항함수의 미분'), MULTI_DIFF = TYPE_INDEX.get('여러 가지 함수의 미분');
+const POLY_INT = TYPE_INDEX.get('다항함수의 적분'), MULTI_INT = TYPE_INDEX.get('여러 가지 함수의 적분');
+const normSubject = (s) => String(s || '').normalize('NFKC').replace(/\s+/g, '');
+const SUBJECT_TYPES = new Map(Object.entries({
+'수학(상)': ['다항식', '방정식과 부등식', '도형의 방정식'],
+'수학(하)': ['집합과 명제', '함수와 그래프', '경우의 수'],
+'공통수학1': ['다항식', '방정식과 부등식', '경우의 수', '행렬'],
+'공통수학2': ['도형의 방정식', '집합과 명제', '함수와 그래프'],
+'수학I': ['지수와 로그', '지수함수와 로그함수', '삼각함수', '수열'],
+'대수': ['지수와 로그', '지수함수와 로그함수', '삼각함수', '수열'],
+'수학II': ['함수의 극한과 연속', '다항함수의 미분', '다항함수의 적분'],
+'미적분I': ['함수의 극한과 연속', '다항함수의 미분', '다항함수의 적분'],
+'미적분': ['수열의 극한', '여러 가지 함수의 미분', '여러 가지 함수의 적분'],
+'미적분II': ['수열의 극한', '여러 가지 함수의 미분', '여러 가지 함수의 적분'],
+'확률과 통계': ['경우의 수', '확률', '통계'],
+'기하': ['이차곡선', '평면벡터', '공간도형과 공간좌표'],
+}).map(([k, v]) => [normSubject(k), new Set(v)]));
+const MIN_SCORE = 2;
+/** 문제(가중치 1)와 연결된 해설(가중치 0.5)의 글자로 유형 점수를 매긴다. */
+function scoreProblem(problem, solution, subject) {
+const scores = new Array(TYPES.length).fill(0);
+const reasons = TYPES.map(() => []);
+const favored = SUBJECT_TYPES.get(normSubject(subject));
+const polyBook = !!favored?.has('다항함수의 미분'); // 수학II·미적분I: 초월함수를 다루지 않는다
+let transcendental = false;
+const add = (text, weight) => {
+const t = prepare(text);
+if (!t.flat) return;
+if (isTrans(t)) transcendental = true;
+TYPES.forEach((type, i) => {
+for (const rule of type.rules) {
+if ((rule.trans && polyBook) || !rule.test(t)) continue;
+scores[i] += rule.w * weight;
+if (!reasons[i].includes(rule.label)) reasons[i].push(rule.label);
+}
+});
+};
+add(problem?.text, 1);
+add(solution?.text, 0.5);
+// 초월함수(지수·로그·삼각함수)를 미분·적분하면 미적분 단원이다.
+if (transcendental && !polyBook) {
+for (const [from, to] of [[POLY_DIFF, MULTI_DIFF], [POLY_INT, MULTI_INT]]) {
+if (!scores[from]) continue;
+scores[to] += scores[from]; scores[from] = 0;
+for (const r of reasons[from]) if (!reasons[to].includes(r)) reasons[to].push(r);
+}
+}
+if (favored) scores.forEach((s, i) => { if (s > 0 && favored.has(TYPES[i].label)) scores[i] = s * 1.3; });
+let best = 0;
+for (let i = 1; i < scores.length; i++) if (scores[i] > scores[best]) best = i;
+const top = scores[best];
+const second = Math.max(0, ...scores.filter((_, i) => i !== best));
+const type = top >= MIN_SCORE ? TYPES[best].label : null;
+return { type, score: top, strong: top >= 3 && top - second >= 1, reasons: type ? reasons[best].slice(0, 4) : [] };
+}
+/**
+* 한 권의 문제를 분류한다. 글자 근거가 약한 문제는 같은 단원 안의 앞뒤 문제 유형으로 보정한다
+* (문제집은 보통 같은 유형을 연달아 싣는다). 반환: Map(id → {type, source:'rule'|'neighbor'|null, reasons, score})
+*/
+function classifyBook(problems, solutionsById = new Map(), subject = '') {
+const ordered = problems.slice().sort((a, b) => ((a.section ?? 1) - (b.section ?? 1)) || (a.number - b.number));
+const base = ordered.map((p) => ({ p, ...scoreProblem(p, solutionsById.get(p.solutionId), p.subjectLLM || subject) }));
+const nearest = (i, dir) => {
+for (let j = i + dir, d = 1; j >= 0 && j < base.length && d <= 3; j += dir, d++) {
+if ((base[j].p.section ?? 1) !== (base[i].p.section ?? 1)) return null;
+if (base[j].strong) return { type: base[j].type, d };
+}
+return null;
+};
+const out = new Map();
+base.forEach((b, i) => {
+let type = b.type, source = type ? 'rule' : null, reasons = b.reasons;
+if (!b.strong) {
+const prev = nearest(i, -1), next = nearest(i, 1);
+if (prev && next && prev.type === next.type) {
+if (type !== prev.type) { type = prev.type; source = 'neighbor'; reasons = []; }
+} else if (!type) {
+const only = prev && !next ? prev : next && !prev ? next : null;
+if (only && only.d <= 2) { type = only.type; source = 'neighbor'; reasons = []; }
+}
+}
+out.set(b.p.id, { type, source, reasons, score: b.score });
+});
+return out;
+}
+const ALIASES = {
+'미분': '다항함수의 미분', '적분': '다항함수의 적분', '미분법': '여러 가지 함수의 미분', '적분법': '여러 가지 함수의 적분',
+'도함수의활용': '다항함수의 미분', '정적분의활용': '다항함수의 적분', '함수': '함수와 그래프', '순열과조합': '경우의 수',
+'순열': '경우의 수', '조합': '경우의 수', '통계적추정': '통계', '확률분포': '통계', '벡터': '평면벡터',
+'공간도형': '공간도형과 공간좌표', '공간좌표': '공간도형과 공간좌표', '지수': '지수와 로그', '로그': '지수와 로그',
+'지수함수': '지수함수와 로그함수', '로그함수': '지수함수와 로그함수', '극한': '함수의 극한과 연속',
+'방정식': '방정식과 부등식', '부등식': '방정식과 부등식', '도형': '도형의 방정식', '집합': '집합과 명제', '명제': '집합과 명제',
+'여러가지미분법': '여러 가지 함수의 미분', '여러가지적분법': '여러 가지 함수의 적분',
+};
+const NO_TYPE = new Set(['미분류', '기타', '없음', '모름', 'null', 'none', 'unknown', 'n/a']);
+// 단원 이름이 과목 밖 유형으로 풀렸을 때 그 과목 안의 유형으로 옮긴다 (예: 미적분의 "삼각함수의 극한" → 여러 가지 함수의 미분)
+const CALCULUS_REMAP = {
+'다항함수의 미분': '여러 가지 함수의 미분', '다항함수의 적분': '여러 가지 함수의 적분', '함수의 극한과 연속': '여러 가지 함수의 미분',
+'삼각함수': '여러 가지 함수의 미분', '지수함수와 로그함수': '여러 가지 함수의 미분', '지수와 로그': '여러 가지 함수의 미분', '수열': '수열의 극한',
+};
+const POLY_REMAP = { '여러 가지 함수의 미분': '다항함수의 미분', '여러 가지 함수의 적분': '다항함수의 적분' };
+const SUBJECT_REMAP = new Map([['미적분', CALCULUS_REMAP], ['미적분II', CALCULUS_REMAP], ['수학II', POLY_REMAP], ['미적분I', POLY_REMAP]]);
+/**
+* AI가 돌려준 유형·단원 이름을 표준 유형으로 맞춘다. 목록의 이름과 정확히 같으면 그대로 믿고,
+* 추정한 경우에는 과목 안의 유형만 받아들인다. 알 수 없으면 null (자동 분류에 맡김)
+*/
+const normCache = new Map();
+function normalizeType(value, subject) {
+const ck = `${value ?? ''}\u0000${subject ?? ''}`;
+if (normCache.has(ck)) return normCache.get(ck);
+const r = normalizeTypeUncached(value, subject);
+if (normCache.size > 5000) normCache.clear();
+normCache.set(ck, r);
+return r;
+}
+function normalizeTypeUncached(value, subject) {
+const s = String(value ?? '').normalize('NFKC').trim();
+const key = s.replace(/\s+/g, '').toLowerCase();
+if (!key || NO_TYPE.has(key)) return null;
+const exact = TYPES.find((t) => t.label.replace(/\s+/g, '') === key);
+if (exact) return exact.label;
+const type = ALIASES[key] || scoreProblem({ text: s }, null, subject).type;
+const sk = normSubject(subject);
+const allowed = SUBJECT_TYPES.get(sk);
+if (!type || !allowed || allowed.has(type)) return type;
+return SUBJECT_REMAP.get(sk)?.[type] ?? null;
+}
+/** 실제로 쓸 유형: 직접 지정 > AI > 자동. bookSubject는 AI가 과목을 남기지 않은 예전 기록에 쓴다 */
+function effectiveType(p, auto, bookSubject = '') {
+if (p.typeManual) return { type: p.typeManual, source: '수동', reasons: [] };
+const ai = p.typeLLM || (p.unit ? normalizeType(p.unit, p.subjectLLM || bookSubject) : null);
+if (ai) return { type: ai, source: 'AI', reasons: [] };
+if (auto?.type) return { type: auto.type, source: auto.source === 'neighbor' ? '자동·앞뒤 문제' : '자동', reasons: auto.reasons || [] };
+return { type: UNCLASSIFIED, source: '', reasons: [] };
+}
+const isStandardType = (label) => TYPE_INDEX.has(label);
+const typeRank = (label) => (TYPE_INDEX.has(label) ? TYPE_INDEX.get(label) : label === UNCLASSIFIED ? TYPES.length + 1 : TYPES.length);
+/** 표준 유형 순서 → 직접 만든 유형(가나다순) → 미분류 */
+function compareTypes(a, b) {
+return (typeRank(a) - typeRank(b)) || String(a).localeCompare(String(b), 'ko');
+}
+return {
+UNCLASSIFIED, AREAS, TYPES: TYPES.map(({ label, area }) => ({ label, area })), TYPE_LABELS: TYPES.map((t) => t.label),
+scoreProblem, classifyBook, normalizeType, effectiveType, isStandardType, compareTypes,
+};
+})();
 M.select = (() => {
 const { effectiveGrade } = M.grade;
 function rng(seed) {
@@ -478,11 +766,12 @@ if (effectiveGrade(p) == null || !p.image) return false;
 if (opts.requireSolution && !p.solutionId) return false;
 if (opts.bookIds?.length && !opts.bookIds.includes(p.bookId)) return false;
 if (opts.subjects?.length && !opts.subjects.includes(p.subject)) return false;
+if (opts.excludeTypes?.length && opts.excludeTypes.includes(p.type)) return false;
 return true;
 });
 }
 /**
-* pool: 문제 목록, opts: {target(1~9), count, mix, seed, requireSolution, bookIds, subjects}
+* pool: 문제 목록, opts: {target(1~9), count, mix, seed, requireSolution, bookIds, subjects, excludeTypes}
 * 쉬운 문제 → 어려운 문제 순으로 정렬해서 반환
 */
 function selectProblems(pool, opts) {

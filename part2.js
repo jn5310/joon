@@ -121,6 +121,7 @@ return { ocrCanvas, terminateOcr };
 })();
 M.llm = (() => {
 const { loadImage } = M.imaging;
+const { TYPE_LABELS, normalizeType } = M.classify;
 const PROVIDERS = {
 gemini:    { label: 'Google Gemini (무료 등급 있음)', model: 'gemini-2.5-flash', needsKey: true },
 anthropic: { label: 'Anthropic Claude', model: 'claude-sonnet-4-5', needsKey: true },
@@ -143,8 +144,9 @@ ${subjectHint ? `참고: 이 책의 과목은 "${subjectHint}"입니다.
 - 6: 쉬운 3점
 - 7: 2점 수준의 계산 문제
 - 8~9: 개념 확인, 공식 대입, 기초 계산
+유형(type)은 다음 목록에서 가장 알맞은 하나를 글자 그대로 고르세요: ${TYPE_LABELS.join(', ')}
 반드시 아래 JSON 형식으로만 답하세요:
-{"grade": 정수, "subject": "과목(${SUBJECTS.join('/')} 중 하나)", "unit": "단원명", "answer": "정답(알 수 있으면, 없으면 null)", "reason": "한 문장 근거"}`;
+{"grade": 정수, "subject": "과목(${SUBJECTS.join('/')} 중 하나)", "unit": "단원명", "type": "유형(위 목록 중 하나)", "answer": "정답(알 수 있으면, 없으면 null)", "reason": "한 문장 근거"}`;
 }
 /** LLM에는 원본 포맷을 유지하고, 필요할 때만 고품질 무손실로 축소한다. */
 async function shrink(dataURL, maxW = 1600) {
@@ -167,7 +169,10 @@ if (!m) throw new Error('JSON 응답 없음: ' + text.slice(0, 200));
 const o = JSON.parse(m[0]);
 const g = Math.round(Number(o.grade));
 if (!(g >= 1 && g <= 9)) throw new Error('grade 범위 오류: ' + o.grade);
-return { grade: g, subject: o.subject || null, unit: o.unit || null, answer: o.answer == null || o.answer === 'null' ? null : String(o.answer), reason: o.reason || '' };
+return {
+grade: g, subject: o.subject || null, unit: o.unit || null, type: o.type == null || o.type === 'null' ? null : String(o.type),
+answer: o.answer == null || o.answer === 'null' ? null : String(o.answer), reason: o.reason || '',
+};
 }
 async function call(cfg, prompt, images) {
 const { provider, apiKey, model } = cfg;
@@ -242,7 +247,10 @@ if (solution?.image) images.push(await shrink(solution.image));
 const prompt = buildPrompt(subjectHint, !!solution?.image);
 for (let attempt = 0; ; attempt++) {
 try {
-return await call(cfg, prompt, images);
+const r = await call(cfg, prompt, images);
+const subject = r.subject || subjectHint;
+r.type = normalizeType(r.type, subject) || normalizeType(r.unit, subject);
+return r;
 } catch (e) {
 const retryable = e.status === 429 || (e.status >= 500 && e.status < 600);
 if (!retryable || attempt >= 3) throw e;
