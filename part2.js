@@ -24,8 +24,8 @@ async function renderPage(doc, pageNo, scale) {
 const page = await doc.getPage(pageNo);
 const viewport = page.getViewport({ scale });
 const canvas = document.createElement('canvas');
-canvas.width = Math.floor(viewport.width);
-canvas.height = Math.floor(viewport.height);
+canvas.width = Math.ceil(viewport.width);
+canvas.height = Math.ceil(viewport.height);
 const ctx = canvas.getContext('2d', { willReadFrequently: true });
 ctx.fillStyle = '#fff';
 ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -146,16 +146,20 @@ ${subjectHint ? `참고: 이 책의 과목은 "${subjectHint}"입니다.
 반드시 아래 JSON 형식으로만 답하세요:
 {"grade": 정수, "subject": "과목(${SUBJECTS.join('/')} 중 하나)", "unit": "단원명", "answer": "정답(알 수 있으면, 없으면 null)", "reason": "한 문장 근거"}`;
 }
-/** 전송 전 이미지 축소 (토큰/비용 절약) */
-async function shrink(dataURL, maxW = 1000) {
+/** LLM에는 원본 포맷을 유지하고, 필요할 때만 고품질 무손실로 축소한다. */
+async function shrink(dataURL, maxW = 1600) {
 const im = await loadImage(dataURL);
+const sourceMime = (dataURL.match(/^data:(image\/(?:png|jpe?g));base64,/)?.[1] || 'image/png').replace('jpg', 'jpeg');
 const r = Math.min(1, maxW / im.naturalWidth);
+if (r === 1) return { data: dataURL.split(',')[1], mime: sourceMime };
 const c = document.createElement('canvas');
-c.width = Math.round(im.naturalWidth * r); c.height = Math.round(im.naturalHeight * r);
+c.width = Math.max(1, Math.round(im.naturalWidth * r));
+c.height = Math.max(1, Math.round(im.naturalHeight * r));
 const ctx = c.getContext('2d');
+ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
 ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
 ctx.drawImage(im, 0, 0, c.width, c.height);
-return c.toDataURL('image/jpeg', 0.85).split(',')[1];
+return { data: c.toDataURL('image/png').split(',')[1], mime: 'image/png' };
 }
 function parseJsonLoose(text) {
 const m = text.match(/\{[\s\S]*\}/);
@@ -178,7 +182,7 @@ headers: {
 body: JSON.stringify({
 model, max_tokens: 400,
 messages: [{ role: 'user', content: [
-...images.map((d) => ({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: d } })),
+...images.map((d) => ({ type: 'image', source: { type: 'base64', media_type: d.mime, data: d.data } })),
 { type: 'text', text: prompt },
 ] }],
 }),
@@ -193,7 +197,7 @@ body: JSON.stringify({
 model, response_format: { type: 'json_object' },
 messages: [{ role: 'user', content: [
 { type: 'text', text: prompt },
-...images.map((d) => ({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${d}` } })),
+...images.map((d) => ({ type: 'image_url', image_url: { url: `data:${d.mime};base64,${d.data}` } })),
 ] }],
 }),
 });
@@ -204,7 +208,7 @@ res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${enc
 method: 'POST',
 headers: { 'content-type': 'application/json' },
 body: JSON.stringify({
-contents: [{ parts: [{ text: prompt }, ...images.map((d) => ({ inline_data: { mime_type: 'image/jpeg', data: d } }))] }],
+contents: [{ parts: [{ text: prompt }, ...images.map((d) => ({ inline_data: { mime_type: d.mime, data: d.data } }))] }],
 generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
 }),
 });
@@ -216,7 +220,7 @@ const base = (cfg.baseUrl || 'http://localhost:11434').replace(/\/$/, '');
 res = await fetch(`${base}/api/chat`, {
 method: 'POST',
 headers: { 'content-type': 'application/json' },
-body: JSON.stringify({ model, stream: false, format: 'json', messages: [{ role: 'user', content: prompt, images }] }),
+body: JSON.stringify({ model, stream: false, format: 'json', messages: [{ role: 'user', content: prompt, images: images.map((d) => d.data) }] }),
 });
 if (!res.ok) throw httpError(res, await res.text());
 text = (await res.json()).message.content;
@@ -305,7 +309,8 @@ let w = (item.w / s) * PX_TO_MM * zoom;
 let h = (item.h / s) * PX_TO_MM * zoom;
 if (w > colW) { h *= colW / w; w = colW; }
 if (h > fullH()) { w *= fullH() / h; h = fullH(); }
-return { image: item.image, fmt: 'JPEG', w, h };
+const fmt = item.imageFormat || (item.image.startsWith('data:image/png') ? 'PNG' : 'JPEG');
+return { image: item.image, fmt, w, h };
 };
 const heightOf = (blocks) => blocks.reduce((s, b) => s + b.h + 1.5, 0);
 const place = (b) => {
@@ -393,6 +398,38 @@ leftTol: 0.1,      // 번호가 단 왼쪽 끝에서 이 비율 안에 있어야
 maxSkip: 3,        // 번호 건너뛰기 허용 폭
 forceOcr: false,   // 텍스트가 있어도 OCR 강제
 };
+/** 명확한 사진성 질감만 JPEG로 저장하고, 그래프·도형처럼 애매한 페이지는 PNG를 우선한다. */
+function encodeRenderedPage(canvas, imageData) {
+let sampled = 0, midtone = 0, softChanges = 0, comparisons = 0;
+const toneBins = new Set(), colorBins = new Set();
+const step = Math.max(1, Math.floor(Math.sqrt((imageData.width * imageData.height) / 50000)));
+for (let y = 0; y < imageData.height; y += step) {
+let previousLum = null;
+for (let x = 0; x < imageData.width; x += step) {
+const i = (y * imageData.width + x) * 4;
+const r = imageData.data[i], g = imageData.data[i + 1], b = imageData.data[i + 2];
+const lum = (r * 299 + g * 587 + b * 114) / 1000;
+if (lum > 40 && lum < 245) midtone++;
+toneBins.add(Math.floor(lum / 8));
+colorBins.add((r >> 4) << 8 | (g >> 4) << 4 | (b >> 4));
+if (previousLum != null) {
+const delta = Math.abs(lum - previousLum);
+if (delta >= 3 && delta <= 48) softChanges++;
+comparisons++;
+}
+previousLum = lum;
+sampled++;
+}
+}
+const midtoneRatio = midtone / sampled;
+const textureRatio = comparisons ? softChanges / comparisons : 0;
+const photographic = midtoneRatio > 0.12 && textureRatio > 0.12 && (
+colorBins.size > 96 || toneBins.size > 24
+);
+return photographic
+? { image: canvas.toDataURL('image/jpeg', 0.95), imageFormat: 'JPEG' }
+: { image: canvas.toDataURL('image/png'), imageFormat: 'PNG' };
+}
 async function ingestPdf(book, kind, file, opts, log, control) {
 const doc = await openPdf(file);
 const metas = [];
@@ -415,9 +452,11 @@ ocr = true;
 log(`[${kind === 'problem' ? '문제' : '해설'}] ${p}/${doc.numPages} 쪽 (텍스트 PDF)`, p / doc.numPages);
 }
 const ctx = canvas.getContext('2d', { willReadFrequently: true });
-const columns = detectColumns(ctx.getImageData(0, 0, canvas.width, canvas.height), opts);
-const meta = { id: pageId(book.id, kind, p), bookId: book.id, kind, index: p, width: canvas.width, height: canvas.height, columns, lines, ocr };
-await db.put('pages', { ...meta, image: canvas.toDataURL('image/jpeg', 0.88) });
+const pageImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+const columns = detectColumns(pageImageData, opts);
+const encoded = encodeRenderedPage(canvas, pageImageData);
+const meta = { id: pageId(book.id, kind, p), bookId: book.id, kind, index: p, width: canvas.width, height: canvas.height, columns, lines, ocr, imageFormat: encoded.imageFormat };
+await db.put('pages', { ...meta, image: encoded.image });
 metas.push(meta);
 canvas.width = canvas.height = 0; // 메모리 해제
 // 진행 중이던 페이지는 온전히 저장한 뒤에만 멈춘다.

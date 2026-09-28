@@ -226,7 +226,7 @@ if (!input) return;
 const m = input.trim().match(/^(?:(\d+)\s*-\s*)?(\d+)$/);
 if (!m) return alert('번호 형식이 올바르지 않습니다.');
 const section = m[1] ? +m[1] : 1, number = +m[2];
-const t = trimBox(rv.imageData, box, 6) || box;
+const t = trimBox(rv.imageData, box) || box;
 const frag = { page: rv.page, ...t };
 let it = rv.items.find((x) => x.section === section && x.number === number);
 if (it) {
