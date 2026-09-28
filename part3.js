@@ -47,11 +47,8 @@ return (msg, frac) => {
 if (msg) {
 const last = pre.lastChild?.textContent || '';
 const key = (m) => m.replace(/[\d/]+/g, '#');
-if (pre.lastChild && key(last) === key(msg + '
-')) pre.lastChild.textContent = msg + '
-';
-else pre.append(document.createTextNode(msg + '
-'));
+if (pre.lastChild && key(last) === key(msg + '\n')) pre.lastChild.textContent = msg + '\n';
+else pre.append(document.createTextNode(msg + '\n'));
 pre.scrollTop = pre.scrollHeight;
 }
 if (frac != null) bar.style.width = Math.round(frac * 100) + '%';
@@ -170,8 +167,7 @@ const d = rv.drag; rv.drag = null;
 const box = { x0: Math.min(d.x0, d.x1), y0: Math.min(d.y0, d.y1), x1: Math.max(d.x0, d.x1), y1: Math.max(d.y0, d.y1) };
 drawOverlay();
 if (box.x1 - box.x0 < 15 || box.y1 - box.y0 < 15) { rv.sel = null; drawOverlay(); renderSide(); return; }
-const input = prompt('이 영역의 번호를 입력하세요.
-이미 있는 번호면 그 항목에 이어붙입니다. (단원이 여러 개면 "2-15" 형식)');
+const input = prompt('이 영역의 번호를 입력하세요.\n이미 있는 번호면 그 항목에 이어붙입니다. (단원이 여러 개면 "2-15" 형식)');
 if (!input) return;
 const m = input.trim().match(/^(?:(\d+)\s*-\s*)?(\d+)$/);
 if (!m) return alert('번호 형식이 올바르지 않습니다.');
@@ -279,8 +275,7 @@ $('#rv-prev').addEventListener('click', () => { if (rv.page > 1) { rv.page--; rv
 $('#rv-next').addEventListener('click', () => { if (rv.page < (rv.book?.pageCounts?.[rv.kind] || 1)) { rv.page++; rv.sel = null; showPage(); } });
 $('#rv-page').addEventListener('change', () => { rv.page = Math.max(1, Math.min(+$('#rv-page').value, rv.book?.pageCounts?.[rv.kind] || 1)); rv.sel = null; showPage(); });
 $('#rv-reseg').addEventListener('click', async () => {
-if (!rv.book || !confirm('수동 수정 내용과 (문제의 경우) 난이도 판정 결과가 사라집니다. 다시 분리할까요?
-분리 설정은 책 추가 탭의 "고급 설정" 값을 사용합니다.')) return;
+if (!rv.book || !confirm('수동 수정 내용과 (문제의 경우) 난이도 판정 결과가 사라집니다. 다시 분리할까요?\n분리 설정은 책 추가 탭의 "고급 설정" 값을 사용합니다.')) return;
 rv.book.options = { ...rv.book.options, top: +$('#opt-top').value, bottom: +$('#opt-bottom').value, leftTol: +$('#opt-left').value, maxSkip: +$('#opt-skip').value };
 await db.put('books', rv.book);
 $('#rv-side').textContent = '다시 분리하는 중...';
