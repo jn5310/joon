@@ -48,7 +48,20 @@ button:disabled { opacity: .5; cursor: default; }
 .hist .bar b { position: absolute; top: -18px; width: 100%; text-align: center; font-size: 12px; font-weight: normal; }
 .checks { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 13px; max-width: 600px; }
 .bookrow { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 10px; margin: 6px 0; display: flex; justify-content: space-between; align-items: center; }
-@media (max-width: 900px) { .review { flex-direction: column; } .side { width: 100%; position: static; } .cols2 { grid-template-columns: 1fr; } }
+.classify { display: flex; gap: 12px; align-items: flex-start; }
+.facets { width: 260px; flex: none; background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 10px; position: sticky; top: 60px; max-height: 85vh; overflow: auto; }
+.facets h3 { margin: 4px 0 6px; font-size: 14px; }
+.facet-list { margin-bottom: 12px; }
+.facet-list button { display: flex; justify-content: space-between; gap: 8px; width: 100%; border: 0; background: transparent; text-align: left; padding: 5px 8px; border-radius: 6px; }
+.facet-list button:hover { background: #f0f3fa; }
+.facet-list button.active { background: #e8edff; color: #1f3a93; font-weight: 700; }
+.facet-list .count { color: #666; font-weight: normal; }
+.facet-area { font-size: 12px; color: #888; margin: 8px 8px 2px; }
+.cl-main { flex: 1; min-width: 0; }
+.cl-group > summary { font-weight: 700; font-size: 15px; margin: 12px 0 6px; cursor: pointer; }
+.card select { width: 13em; max-width: 100%; }
+.cl-group .more { margin: 8px 0; }
+@media (max-width: 900px) { .review, .classify { flex-direction: column; } .side, .facets { width: 100%; position: static; max-height: none; } .cols2 { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -57,8 +70,9 @@ button:disabled { opacity: .5; cursor: default; }
 <nav id="tabs">
 <button data-tab="ingest" class="active">① 책 추가</button>
 <button data-tab="review">② 검토·수정</button>
-<button data-tab="grade">③ 난이도</button>
-<button data-tab="build">④ 시험지 만들기</button>
+<button data-tab="classify">③ 문제 분류</button>
+<button data-tab="grade">④ 난이도</button>
+<button data-tab="build">⑤ 시험지 만들기</button>
 <button data-tab="library">라이브러리</button>
 </nav>
 </header>
@@ -110,7 +124,24 @@ button:disabled { opacity: .5; cursor: default; }
 <h3>분리된 항목 <span id="rv-count"></span></h3>
 <div id="rv-list" class="cards"></div>
 </section>
-<!-- ③ 난이도 -->
+<!-- ③ 문제 분류 -->
+<section id="tab-classify" class="tab">
+<h2>문제 분류</h2>
+<p class="hint">분리된 문제를 책별로 모으고, 인식된 글자와 연결된 해설을 바탕으로 단원 유형을 자동 분류합니다. 우선순위는 직접 지정 &gt; AI 판정 &gt; 자동 분류이며, 책과 유형을 함께 골라 좁혀 볼 수 있습니다.</p>
+<div class="classify">
+<aside class="facets">
+<h3>책별</h3>
+<div id="cl-books" class="facet-list"></div>
+<h3>유형별</h3>
+<div id="cl-types" class="facet-list"></div>
+</aside>
+<div class="cl-main">
+<div class="toolbar"><b id="cl-title"></b><span id="cl-count" class="hint"></span></div>
+<div id="cl-groups"></div>
+</div>
+</div>
+</section>
+<!-- ④ 난이도 -->
 <section id="tab-grade" class="tab">
 <h2>난이도 판정</h2>
 <div class="cols2">
@@ -141,7 +172,7 @@ button:disabled { opacity: .5; cursor: default; }
 <h3>등급 분포</h3>
 <div id="gr-hist" class="hist"></div>
 </section>
-<!-- ④ 시험지 만들기 -->
+<!-- ⑤ 시험지 만들기 -->
 <section id="tab-build" class="tab">
 <h2>등급대별 시험지 만들기</h2>
 <div class="form">
@@ -159,6 +190,7 @@ button:disabled { opacity: .5; cursor: default; }
 <div class="form">
 <div><b>책</b><div id="bd-books" class="checks"></div></div>
 <div><b>과목</b><div id="bd-subjects" class="checks"></div></div>
+<div><b>유형</b><div id="bd-types" class="checks"></div></div>
 </div>
 <button id="bd-select" class="primary">문제 고르기</button>
 <button id="bd-pdf" class="primary">PDF 만들기</button>

@@ -9,6 +9,7 @@ const { itemKey } = M.segment;
 const { BOOK_LEVELS, heuristicGrades, effectiveGrade, gradeSource } = M.grade;
 const { PROVIDERS, SUBJECTS, gradeWithLLM, loadConfig, saveConfig } = M.llm;
 const { MIX_PRESETS, selectProblems, replaceOne } = M.select;
+const { UNCLASSIFIED, AREAS, TYPES, classifyBook, effectiveType, isStandardType, compareTypes } = M.classify;
 const { buildPdf } = M.build;
 const $ = (s) => document.querySelector(s);
 const el = (tag, attrs = {}, ...kids) => {
@@ -33,13 +34,18 @@ s.replaceChildren(...books.map((b) => opt(b.id, b.name, b.id === cur)));
 }
 renderLibrary();
 renderBuildFilters();
+if ($('#tab-classify').classList.contains('active')) renderClassify();
 }
 function activateTab(name) {
 const button = $(`#tabs button[data-tab="${name}"]`);
 document.querySelectorAll('#tabs button').forEach((x) => x.classList.toggle('active', x === button));
 document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.id === 'tab-' + name));
-if (name === 'review') loadReview();
-if (name === 'grade') renderHist();
+if (name !== 'classify') releaseClassifyItems();
+if (name === 'review') return loadReview();
+if (name === 'classify') return renderClassify();
+if (name === 'grade') return renderHist();
+if (name === 'build' && buildFiltersStale) return renderBuildFilters(); // 유형이 바뀐 뒤에만 필터를 새로 만든다
+return Promise.resolve();
 }
 document.querySelectorAll('#tabs button').forEach((b) => b.addEventListener('click', () => activateTab(b.dataset.tab)));
 $('#in-subject').append(opt('', '(미정)'), ...SUBJECTS.map((s) => opt(s, s)));
@@ -103,15 +109,17 @@ log(`부분 처리 완료: ${label} ${at.processedPages}/${at.totalPages}쪽 · 
 log(`완료: 문제 ${s.problems}개, 해설 ${s.solutions}개, 연결 ${s.matched}개`, 1);
 }
 await runHeuristic(book.id);
+cl.bookId = book.id; cl.type = '';
 await refreshBooks();
 $('#rv-book').value = book.id;
+log(`유형 분류 완료: ${typeSummary(await db.byBook('items', book.id)) || '분류할 문제 없음'}`);
 if (book.ingest?.status === 'stopped') {
 log('규칙 기반 난이도 판정 완료. 인식된 문제를 하나씩 확인할 수 있도록 검토 화면을 엽니다.');
 $('#rv-kind').value = 'problem';
 rv.page = 1;
 activateTab('review');
 } else {
-log('규칙 기반 난이도 판정 완료. ② 검토·수정 탭에서 분리 결과를 확인하세요.');
+log('규칙 기반 난이도 판정 완료. ② 검토·수정 탭에서 분리 결과를, ③ 문제 분류 탭에서 책별·유형별 분류를 확인하세요.');
 }
 } catch (e) {
 console.error(e);
@@ -246,6 +254,7 @@ if (['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement?.tagName)) r
 await deleteFragment();
 });
 async function saveItem(it, relinkAfter) {
+buildFiltersStale = true; // 글자·연결이 바뀌면 자동 유형도 바뀔 수 있다
 await finalizeItem(it, rv.cache, null, rv.book.options?.scale || DEFAULT_OPTIONS.scale);
 await db.put('items', it);
 if (relinkAfter) await relink(rv.book.id);
@@ -263,6 +272,7 @@ else await saveItem(it, false);
 drawOverlay(); renderSide();
 }
 async function deleteItem(it) {
+buildFiltersStale = true;
 await db.del('items', it.id);
 rv.items = rv.items.filter((x) => x.id !== it.id);
 rv.sel = null;
@@ -304,9 +314,7 @@ function gradeEditor(p, after) {
 const s = el('select', {}, opt('', '수동 지정 안 함'), ...[1, 2, 3, 4, 5, 6, 7, 8, 9].map((g) => opt(g, `${g}등급`, p.gradeManual === g)));
 s.addEventListener('change', async () => {
 p.gradeManual = s.value ? +s.value : null;
-const fresh = await db.get('items', p.id);
-fresh.gradeManual = p.gradeManual;
-await db.put('items', fresh);
+await db.update('items', p.id, (fresh) => { fresh.gradeManual = p.gradeManual; });
 after && after();
 });
 return s;
@@ -329,10 +337,11 @@ $('#rv-prev').addEventListener('click', () => { if (rv.page > 1) { rv.page--; rv
 $('#rv-next').addEventListener('click', () => { if (rv.page < (rv.book?.pageCounts?.[rv.kind] || 1)) { rv.page++; rv.sel = null; showPage(); } });
 $('#rv-page').addEventListener('change', () => { rv.page = Math.max(1, Math.min(+$('#rv-page').value, rv.book?.pageCounts?.[rv.kind] || 1)); rv.sel = null; showPage(); });
 $('#rv-reseg').addEventListener('click', async () => {
-if (!rv.book || !confirm('수동 수정 내용과 (문제의 경우) 난이도 판정 결과가 사라집니다. 다시 분리할까요?\n분리 설정은 책 추가 탭의 "고급 설정" 값을 사용합니다.')) return;
+if (!rv.book || !confirm('수동 수정 내용과 (문제의 경우) 난이도·유형 판정 결과가 사라집니다. 다시 분리할까요?\n분리 설정은 책 추가 탭의 "고급 설정" 값을 사용합니다.')) return;
 rv.book.options = { ...rv.book.options, top: +$('#opt-top').value, bottom: +$('#opt-bottom').value, leftTol: +$('#opt-left').value, maxSkip: +$('#opt-skip').value };
 await db.put('books', rv.book);
 $('#rv-side').textContent = '다시 분리하는 중...';
+buildFiltersStale = true;
 await segmentKind(rv.book, rv.kind, null, (m) => { $('#rv-side').textContent = m; });
 await relink(rv.book.id);
 if (rv.kind === 'problem') await runHeuristic(rv.book.id);
@@ -340,10 +349,200 @@ await loadReview();
 });
 $('#rv-relink').addEventListener('click', async () => {
 if (!rv.book) return;
+buildFiltersStale = true;
 const s = await relink(rv.book.id);
 alert(`문제 ${s.problems}개 중 ${s.matched}개에 해설이 연결되었습니다.`);
 loadReview();
 });
+/** 책마다 글자 기반 자동 분류를 계산한다 (직접 지정·AI 유형과 무관하므로 항목을 다시 읽기 전까지 재사용 가능) */
+function autoClassify(items) {
+const sols = new Map(), byBook = new Map();
+for (const it of items) {
+if (it.kind === 'solution') sols.set(it.id, it);
+else if (it.kind === 'problem') {
+if (!byBook.has(it.bookId)) byBook.set(it.bookId, []);
+byBook.get(it.bookId).push(it);
+}
+}
+const out = new Map();
+for (const [bookId, probs] of byBook) for (const [id, r] of classifyBook(probs, sols, bookById(bookId)?.subject || '')) out.set(id, r);
+return out;
+}
+const typeOf = (p, auto) => effectiveType(p, auto.get(p.id), bookById(p.bookId)?.subject || '');
+/** 직접 지정 > AI > 자동 순서로 최종 유형을 정한다. 반환: Map(id → {type, source, reasons}) */
+function classifyItems(items) {
+const auto = autoClassify(items);
+const out = new Map();
+for (const p of items) if (p.kind === 'problem') out.set(p.id, typeOf(p, auto));
+return out;
+}
+function typeSummary(items) {
+const counts = new Map();
+for (const { type } of classifyItems(items).values()) counts.set(type, (counts.get(type) || 0) + 1);
+return [...counts].sort((a, b) => ((a[0] === UNCLASSIFIED) - (b[0] === UNCLASSIFIED)) || (b[1] - a[1]) || compareTypes(a[0], b[0]))
+.map(([t, n]) => `${t} ${n}`).join(' · ');
+}
+const cl = { bookId: '', type: '' };
+const clOpen = new Map(); // 사용자가 펼치거나 접은 묶음 상태
+const CARD_PAGE = 60; // 펼친 묶음에서 한 번에 만드는 카드 수
+// 탭이 열려 있는 동안만 항목과 자동 분류 결과를 메모리에 둔다
+let clToken = 0, clItems = null, clLoading = null, clAuto = null;
+function loadClassifyItems() {
+const p = db.all('items').then((items) => { if (clLoading === p) { clItems = items; clAuto = null; clLoading = null; } return items; });
+clLoading = p;
+return p;
+}
+function releaseClassifyItems() {
+clToken++; // 진행 중인 렌더 취소
+clItems = null; clLoading = null; clAuto = null;
+// 카드와 이벤트 처리기가 문제 이미지를 붙잡고 있지 않도록 화면도 비운다
+for (const s of ['#cl-books', '#cl-types', '#cl-groups']) $(s).replaceChildren();
+}
+function facetButton(label, count, active, onclick) {
+return el('button', { class: active ? 'active' : '', onclick }, el('span', {}, label), el('span', { class: 'count' }, count));
+}
+function typeBadge(e) {
+return el('span', { class: 'badge' + (e.type === UNCLASSIFIED ? ' warn' : '') }, e.source ? `${e.type} (${e.source})` : e.type);
+}
+function typeReason(e, p) {
+const bits = [];
+if (e.source === '자동' && e.reasons.length) bits.push(`근거: ${e.reasons.join(' · ')}`);
+if (e.source === '자동·앞뒤 문제') bits.push('근거: 앞뒤 문제와 같은 유형');
+if (p.unit) bits.push(`AI 단원: ${p.unit}`);
+return bits.length ? el('div', { class: 'hint' }, bits.join(' / ')) : null;
+}
+/** 유형 선택 상자 원본. 카드마다 복제해서 쓴다 (옵션을 매번 만드는 것보다 훨씬 빠름) */
+function typeSelectTemplate(customTypes) {
+return el('select', { 'aria-label': '유형 직접 지정' },
+opt('', '유형 직접 지정…'),
+...AREAS.map((area) => el('optgroup', { label: area }, ...TYPES.filter((t) => t.area === area).map((t) => opt(t.label, t.label)))),
+customTypes.length ? el('optgroup', { label: '직접 만든 유형' }, ...customTypes.map((t) => opt(t, t))) : null,
+el('optgroup', { label: '기타' }, opt(UNCLASSIFIED, UNCLASSIFIED), opt('__new__', '새 유형 이름 입력…')));
+}
+function typeEditor(p, template) {
+const s = template.cloneNode(true);
+if (p.typeManual) { s.value = p.typeManual; s.options[0].textContent = '자동 분류로 되돌리기'; }
+s.addEventListener('change', async () => {
+let value = s.value;
+if (value === '__new__') {
+value = (prompt('새 유형 이름을 입력하세요. (예: 나머지정리 활용)') || '').trim().slice(0, 40);
+if (!value) { s.value = p.typeManual || ''; return; }
+}
+const saved = await db.update('items', p.id, (fresh) => { fresh.typeManual = value || null; });
+if (!saved) return;
+buildFiltersStale = true;
+// 저장이 끝나기 전에 탭을 떠났으면 숨은 탭을 다시 그리지 않는다
+if (!$('#tab-classify').classList.contains('active')) return;
+// 현재 메모리 목록의 같은 문제를 고친다. 이후에 시작된 읽기는 이미 새 값을 담고 있다.
+p.typeManual = saved.typeManual;
+const cur = clItems?.find((x) => x.id === p.id);
+if (cur) cur.typeManual = saved.typeManual;
+await renderClassify(false);
+});
+return s;
+}
+async function openInReview(p) {
+$('#rv-book').value = p.bookId;
+$('#rv-kind').value = 'problem';
+rv.page = p.fragments?.[0]?.page || 1;
+await activateTab('review');
+const it = rv.items.find((x) => x.id === p.id);
+if (!it || !rv.rec) return;
+rv.sel = { id: it.id, fi: Math.max(0, it.fragments.findIndex((f) => f.page === rv.page)) };
+drawOverlay(); renderSide();
+$('#rv-canvas').scrollIntoView({ behavior: 'smooth' });
+}
+/** reload=false: 책·유형 선택만 바뀐 경우 메모리의 항목으로 다시 그린다 */
+async function renderClassify(reload = true) {
+const token = ++clToken;
+if (reload) await loadClassifyItems();
+else if (clLoading || !clItems) await (clLoading || loadClassifyItems()); // 읽는 중이면 새 결과를 기다린다
+if (token !== clToken || !clItems) return; // 더 최근 렌더가 시작됐거나 탭을 떠났으면 버린다
+const items = clItems;
+if (!clAuto) clAuto = autoClassify(items);
+const auto = clAuto;
+const bookOrder = new Map(books.map((b, i) => [b.id, i]));
+const entries = items.filter((i) => i.kind === 'problem' && bookById(i.bookId))
+.map((p) => ({ p, book: bookById(p.bookId), ...typeOf(p, auto) }))
+.sort((a, b) => (bookOrder.get(a.p.bookId) - bookOrder.get(b.p.bookId)) || (a.p.section - b.p.section) || (a.p.number - b.p.number));
+if (cl.bookId && !bookById(cl.bookId)) cl.bookId = '';
+const inBook = cl.bookId ? entries.filter((e) => e.p.bookId === cl.bookId) : entries;
+if (cl.type && !inBook.some((e) => e.type === cl.type)) cl.type = '';
+const multiSection = new Set(entries.filter((e) => e.p.section > 1).map((e) => e.p.bookId));
+const customTypes = [...new Set(entries.map((e) => e.p.typeManual).filter((t) => t && t !== UNCLASSIFIED && !isStandardType(t)))].sort(compareTypes);
+// 책별
+const perBook = new Map();
+for (const e of entries) perBook.set(e.p.bookId, (perBook.get(e.p.bookId) || 0) + 1);
+$('#cl-books').replaceChildren(
+facetButton('전체 책', entries.length, !cl.bookId, () => { cl.bookId = ''; renderClassify(false); }),
+...books.map((b) => facetButton(b.name, perBook.get(b.id) || 0, cl.bookId === b.id, () => { cl.bookId = b.id; renderClassify(false); })));
+// 유형별 (선택한 책 기준 개수)
+const counts = new Map();
+for (const e of inBook) counts.set(e.type, (counts.get(e.type) || 0) + 1);
+const pick = (t) => () => { cl.type = t; renderClassify(false); };
+const typeKids = [facetButton('전체 유형', inBook.length, !cl.type, pick(''))];
+for (const area of AREAS) {
+const list = TYPES.filter((t) => t.area === area && counts.has(t.label));
+if (list.length) typeKids.push(el('div', { class: 'facet-area' }, area), ...list.map((t) => facetButton(t.label, counts.get(t.label), cl.type === t.label, pick(t.label))));
+}
+const customShown = [...counts.keys()].filter((t) => t !== UNCLASSIFIED && !isStandardType(t)).sort(compareTypes);
+if (customShown.length) typeKids.push(el('div', { class: 'facet-area' }, '직접 만든 유형'), ...customShown.map((t) => facetButton(t, counts.get(t), cl.type === t, pick(t))));
+if (counts.has(UNCLASSIFIED)) typeKids.push(el('div', { class: 'facet-area' }, '확인 필요'), facetButton(UNCLASSIFIED, counts.get(UNCLASSIFIED), cl.type === UNCLASSIFIED, pick(UNCLASSIFIED)));
+$('#cl-types').replaceChildren(...typeKids);
+// 문제 목록: 유형 하나를 전체 책에서 보면 책별로, 그 밖에는 유형별로 묶는다
+const shown = cl.type ? inBook.filter((e) => e.type === cl.type) : inBook;
+$('#cl-title').textContent = `${cl.bookId ? bookById(cl.bookId).name : '전체 책'} · ${cl.type || '전체 유형'}`;
+$('#cl-count').textContent = `${shown.length}문제`;
+if (!shown.length) {
+$('#cl-groups').replaceChildren(el('p', { class: 'hint' }, entries.length
+? '이 책에는 분리된 문제가 없습니다. ② 검토·수정에서 문제 영역을 추가하세요.'
+: '아직 분리된 문제가 없습니다. ① 책 추가에서 PDF를 넣으세요.'));
+return;
+}
+const groupByBook = !!cl.type && !cl.bookId;
+const groups = new Map();
+for (const e of shown) {
+const key = groupByBook ? e.p.bookId : e.type;
+if (!groups.has(key)) groups.set(key, []);
+groups.get(key).push(e);
+}
+const keys = [...groups.keys()].sort(groupByBook ? (a, b) => bookOrder.get(a) - bookOrder.get(b) : compareTypes);
+const template = typeSelectTemplate(customTypes);
+const card = (e) => {
+const { p, book } = e;
+const num = multiSection.has(p.bookId) ? itemKey(p) : String(p.number);
+return el('div', { class: 'card' },
+el('div', { class: 'row' }, el('b', {}, `${book.name} ${num}번`), typeBadge(e), gradeBadge(p)),
+p.image ? el('img', { src: p.image, loading: 'lazy' }) : el('span', { class: 'badge warn' }, '이미지 없음'),
+typeReason(e, p),
+el('div', { class: 'row' }, typeEditor(p, template), el('button', { onclick: () => openInReview(p) }, '검토에서 보기')));
+};
+// 문제가 많으면 처음에는 접어 두고, 펼칠 때 카드를 만든다. 큰 묶음은 CARD_PAGE개씩 나눠 만든다.
+const defaultOpen = shown.length <= 150;
+$('#cl-groups').replaceChildren(...keys.map((key) => {
+const gk = (groupByBook ? 'b:' : 't:') + key;
+const list = groups.get(key);
+const body = el('div', { class: 'cards' });
+const more = el('button', { class: 'more', hidden: true });
+let made = 0;
+const addMore = () => {
+const next = list.slice(made, made + CARD_PAGE);
+made += next.length;
+body.append(...next.map(card));
+more.hidden = made >= list.length;
+more.textContent = `더 보기 (${list.length - made}문제 남음)`;
+};
+more.addEventListener('click', addMore);
+const fill = () => { if (!made) addMore(); };
+const open = clOpen.has(gk) ? clOpen.get(gk) : defaultOpen;
+if (open) fill();
+// 사용자의 클릭만 기억한다 (open 속성으로 생기는 toggle 이벤트는 기록하지 않음)
+const details = el('details', { class: 'cl-group', open, ontoggle: () => { if (details.open) fill(); } },
+el('summary', { onclick: () => clOpen.set(gk, !details.open) }, groupByBook ? bookById(key).name : key, ' ', el('span', { class: 'hint' }, `${list.length}문제`)),
+body, more);
+return details;
+}));
+}
 async function runHeuristic(bookId) {
 const book = bookById(bookId) || await db.get('books', bookId);
 const items = await db.byBook('items', bookId);
@@ -393,11 +592,13 @@ for (let i = 0; i < todo.length && !stopFlag; i++) {
 const p = todo[i];
 try {
 const r = await gradeWithLLM(c, p, sols.get(p.solutionId), book.subject);
-p.gradeLLM = r.grade; p.unit = r.unit; p.subjectLLM = r.subject; p.llmReason = r.reason;
-if (!p.answer && r.answer) { p.answer = r.answer; p.answerLLM = true; }
-await db.put('items', p);
+// 실행 중에 직접 지정한 유형·등급을 덮어쓰지 않도록 저장 직전의 기록에 AI 결과만 반영한다
+await db.update('items', p.id, (fresh) => {
+fresh.gradeLLM = r.grade; fresh.unit = r.unit; fresh.subjectLLM = r.subject; fresh.llmReason = r.reason; fresh.typeLLM = r.type ?? null;
+if (!fresh.answer && r.answer) { fresh.answer = r.answer; fresh.answerLLM = true; }
+});
 ok++;
-grLog(`${itemKey(p)}번 → ${r.grade}등급 · ${r.subject ?? ''} ${r.unit ?? ''} · ${r.reason}`, (i + 1) / todo.length);
+grLog(`${itemKey(p)}번 → ${r.grade}등급 · ${r.subject ?? ''} ${r.unit ?? ''} · 유형 ${r.type ?? UNCLASSIFIED} · ${r.reason}`, (i + 1) / todo.length);
 } catch (e) {
 fail++;
 grLog(`${itemKey(p)}번 실패: ${e.message}`, (i + 1) / todo.length);
@@ -407,6 +608,8 @@ if (c.delay) await sleep(c.delay);
 }
 grLog(`AI 판정 끝: 성공 ${ok}, 실패 ${fail}${stopFlag ? ' (중지됨)' : ''}`);
 renderHist();
+buildFiltersStale = true;
+if ($('#tab-classify').classList.contains('active')) renderClassify();
 }
 $('#gr-test').addEventListener('click', () => runLLM(true, 1));
 $('#gr-llm').addEventListener('click', () => runLLM(false));
@@ -427,12 +630,17 @@ if (none) hist.append(el('div', { class: 'hint' }, `미판정 ${none}`));
 $('#bd-target').append(...[1, 2, 3, 4, 5, 6, 7, 8, 9].map((g) => opt(g, `${g}등급`, g === 3)));
 $('#bd-mix').append(...Object.entries(MIX_PRESETS).map(([k, v]) => opt(k, v.label)));
 let pool = [], solById = new Map(), selection = [];
+let buildFiltersStale = false;
 async function loadPool() {
 const items = await db.all('items');
 solById = new Map(items.filter((i) => i.kind === 'solution').map((s) => [s.id, s]));
-pool = items.filter((i) => i.kind === 'problem').map((p) => ({ ...p, subject: p.subjectLLM || bookById(p.bookId)?.subject || '(미정)' }));
+const types = classifyItems(items);
+pool = items.filter((i) => i.kind === 'problem').map((p) => ({
+...p, subject: p.subjectLLM || bookById(p.bookId)?.subject || '(미정)', type: types.get(p.id)?.type ?? UNCLASSIFIED,
+}));
 }
 async function renderBuildFilters() {
+buildFiltersStale = false;
 await loadPool();
 const checked = (box) => new Set([...box.querySelectorAll('input:checked')].map((c) => c.value));
 const bb = $('#bd-books'), prevB = checked(bb);
@@ -440,6 +648,13 @@ bb.replaceChildren(...books.map((b) => el('label', {}, el('input', { type: 'chec
 const subs = [...new Set(pool.map((p) => p.subject))].sort();
 const sb = $('#bd-subjects'), prevS = checked(sb);
 sb.replaceChildren(...subs.map((s) => el('label', {}, el('input', { type: 'checkbox', value: s, checked: !prevS.size || prevS.has(s) }), ' ', s)));
+// 유형은 사용자가 끈 것만 기억한다. 새로 생긴 유형은 켜진 상태로 추가된다.
+const typeCounts = new Map();
+for (const p of pool) typeCounts.set(p.type, (typeCounts.get(p.type) || 0) + 1);
+const tb = $('#bd-types');
+const off = new Set([...tb.querySelectorAll('input:not(:checked)')].map((c) => c.value));
+tb.replaceChildren(...[...typeCounts.keys()].sort(compareTypes).map((t) => el('label', {},
+el('input', { type: 'checkbox', value: t, checked: !off.has(t) }), ` ${t} `, el('span', { class: 'hint' }, `(${typeCounts.get(t)})`))));
 }
 function buildOpts() {
 return {
@@ -449,6 +664,7 @@ mix: MIX_PRESETS[$('#bd-mix').value],
 requireSolution: $('#bd-reqsol').checked,
 bookIds: [...$('#bd-books').querySelectorAll('input:checked')].map((c) => c.value),
 subjects: [...$('#bd-subjects').querySelectorAll('input:checked')].map((c) => c.value),
+excludeTypes: [...$('#bd-types').querySelectorAll('input:not(:checked)')].map((c) => c.value),
 };
 }
 $('#bd-select').addEventListener('click', async () => {
@@ -463,7 +679,7 @@ function renderSelection() {
 $('#bd-list').replaceChildren(...selection.map((p, i) => {
 const sol = solById.get(p.solutionId);
 return el('div', { class: 'card' },
-el('div', { class: 'row' }, el('b', {}, `${i + 1}번`), gradeBadge(p), el('span', { class: 'hint' }, `${bookById(p.bookId)?.name ?? ''} ${p.number}번 · ${p.subject}`),
+el('div', { class: 'row' }, el('b', {}, `${i + 1}번`), gradeBadge(p), el('span', { class: 'hint' }, `${bookById(p.bookId)?.name ?? ''} ${p.number}번 · ${p.subject} · ${p.type}`),
 el('button', { onclick: () => { selection = replaceOne(selection, i, pool, buildOpts()); renderSelection(); } }, '교체'),
 el('button', { onclick: () => { selection.splice(i, 1); renderSelection(); } }, '빼기')),
 el('img', { src: p.image, loading: 'lazy' }),
