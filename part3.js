@@ -2,13 +2,13 @@
 var M = window.M || (window.M = {});
 M.app = (() => {
 const db = M.db;
-const { ingestBook, segmentKind, relink, finalizeItem, DEFAULT_OPTIONS, HEARTBEAT_STALE_MS } = M.pipeline;
+const { ingestBook, segmentKind, relink, finalizeItem, pagesWithoutImage, PageImageMissingError, DEFAULT_OPTIONS, HEARTBEAT_STALE_MS } = M.pipeline;
 const { PageCache, pageId, loadImage } = M.imaging;
 const { trimBox } = M.layout;
 const { itemKey } = M.segment;
 const { BOOK_LEVELS, heuristicGrades, effectiveGrade, gradeSource } = M.grade;
 const { PROVIDERS, SUBJECTS, gradeWithLLM, loadConfig, saveConfig } = M.llm;
-const { MIX_PRESETS, selectProblems, replaceOne } = M.select;
+const { MIX_PRESETS, filterPool, selectProblems, replaceOne } = M.select;
 const { UNCLASSIFIED, AREAS, TYPES, classifyBook, effectiveType, isStandardType, compareTypes } = M.classify;
 const { buildPdf } = M.build;
 const $ = (s) => document.querySelector(s);
@@ -16,6 +16,15 @@ const el = (tag, attrs = {}, ...kids) => {
 const e = document.createElement(tag);
 for (const [k, v] of Object.entries(attrs)) {
 if (k === 'class') e.className = v;
+else if (k === 'src' && v != null && typeof v !== 'string') {
+// IndexedDB Blob/외부 폴더 참조를 화면용 object URL로 바꾼다
+M.assets.getBlob(v).then((blob) => {
+const url = URL.createObjectURL(blob);
+e.addEventListener('load', () => URL.revokeObjectURL(url), { once: true });
+e.addEventListener('error', () => URL.revokeObjectURL(url), { once: true });
+e.src = url;
+}).catch(() => { e.alt = '이미지를 열 수 없음'; });
+}
 else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
 else if (v !== false && v != null) e.setAttribute(k, v === true ? '' : v);
 }
@@ -23,6 +32,8 @@ for (const c of kids.flat()) if (c != null) e.append(c.nodeType ? c : String(c))
 return e;
 };
 const opt = (value, label, selected) => el('option', { value, selected: !!selected }, label);
+/** 문제 순서: 본문 번호 먼저, 그다음 예제·유제 같은 라벨별로 단원·번호 순 */
+const byItemOrder = (a, b) => ((a.label ? 1 : 0) - (b.label ? 1 : 0)) || String(a.label || '').localeCompare(String(b.label || '')) || (a.section - b.section) || (a.number - b.number);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /** 숫자 입력칸 읽기: 비었거나 범위를 벗어나면 기본값·경계값으로 바꾼다 */
 const numIn = (sel, def, lo, hi) => { const v = parseFloat($(sel).value); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : def; };
@@ -32,6 +43,8 @@ const msg = String(e?.message || e || '알 수 없는 오류');
 if (db.isQuotaError(e)) return '브라우저 저장 공간이 부족합니다. 라이브러리에서 쓰지 않는 책을 지우거나, 백업한 뒤 정리하세요.';
 if (e?.name === 'PasswordException') return '암호가 걸린 PDF는 열 수 없습니다. 암호를 푼 PDF로 다시 시도하세요.';
 if (e?.name === 'InvalidPDFException' || /Invalid PDF|PDF 구조/i.test(msg)) return 'PDF 파일을 읽을 수 없습니다. 손상되지 않은 PDF인지 확인하세요.';
+if (e?.name === 'NotAllowedError' || /폴더.*권한|폴더 연결이 끊겼/i.test(msg)) return '대용량 저장 폴더 권한이 없습니다. 라이브러리에서 같은 폴더를 다시 연결하세요.';
+if (e?.name === 'NotFoundError') return '대용량 저장 폴더에서 이미지 파일을 찾을 수 없습니다. 폴더(MathFinderData)를 옮기거나 지우지 않았는지 확인하고, 라이브러리에서 같은 폴더를 다시 연결하세요.';
 if (/Tesseract|jsPDF|로드 실패|Failed to fetch|NetworkError|dynamically imported module|Load failed/i.test(msg)) {
 return `필요한 프로그램을 내려받지 못했습니다. 인터넷 연결을 확인한 뒤 다시 시도하세요. (${msg})`;
 }
@@ -60,9 +73,8 @@ s.replaceChildren(...books.map((b) => opt(b.id, b.name, b.id === cur)));
 }
 async function refreshBooks() {
 await reloadBooks();
-renderLibrary();
-renderBuildFilters();
-if ($('#tab-classify').classList.contains('active')) renderClassify();
+await Promise.all([renderLibrary(), renderBuildFilters()]);
+if ($('#tab-classify').classList.contains('active')) await renderClassify();
 }
 function activateTab(name) {
 const button = $(`#tabs button[data-tab="${name}"]`);
@@ -167,7 +179,7 @@ ingestControl = null;
 if (e?.bookId) {
 // 이미 분리된 문제는 바로 쓸 수 있게 해설 연결·난이도 판정을 해 둔다 (실패해도 무시)
 try { await relink(e.bookId); await runHeuristic(e.bookId); } catch { /* 저장 공간 부족 등 */ }
-log('저장된 쪽까지는 남겨 두었습니다. ② 검토·수정에서 확인하고, 분리되지 않은 종류가 있으면 "이 종류 전체 다시 분리"를 누르세요.');
+log('저장된 쪽까지는 남겨 두었습니다. ② 검토·수정에서 확인하고, 분리되지 않은 종류가 있으면 "자동 인식 다시 분석"를 누르세요.');
 }
 // 어느 단계에서 실패했든 목록은 새로 고친다 (저장은 끝났는데 목록에만 안 보이는 일 방지)
 await refreshBooks().catch(() => {});
@@ -197,9 +209,10 @@ ev.returnValue = '';
 * | 'interrupted'(창을 닫는 등으로 끊김: 처리 중 표시가 오래 갱신되지 않음)
 */
 const endedHere = new Set(); // 이 창에서 시작했다가 끝난(실패한) 책: 기록이 '처리 중'으로 남아도 끊긴 것으로 본다
-const busyBooks = new Set(); // 이 창에서 다시 분리 중인 책 (그동안 삭제·영역 편집을 막는다)
+const busyBooks = new Set(); // 이 창에서 다시 분리하거나 저장 공간을 정리 중인 책 (그동안 삭제·영역 편집·다시 분리를 막는다)
+const storageBusy = new Set(); // 그중 저장 공간 최적화로 잠근 책 (표시 문구용)
 function ingestState(b) {
-if (b && (busyBooks.has(b.id) || llmBookId === b.id)) return 'busy'; // 이 창에서 다시 분리·AI 판정 중
+if (b && (busyBooks.has(b.id) || llmBookId === b.id)) return 'busy'; // 이 창에서 다시 분리·AI 판정·저장 공간 정리 중
 const st = b?.ingest?.status;
 if (st === 'processing') {
 if (ingestControl?.bookId === b.id) return 'processing';
@@ -226,9 +239,9 @@ const pages = at ? `${at.processedPages}${at.totalPages ? '/' + at.totalPages : 
 const pending = pendingKinds(b, counts);
 const names = pending.map((k) => KIND_LABEL[k]).join('·');
 const todo = pending.length
-? ` ${names}${josa(names, '은', '는')} 페이지만 저장되고 아직 나뉘지 않았습니다. 위에서 종류를 고른 뒤 "이 종류 전체 다시 분리"를 누르세요.`
+? ` ${names}${josa(names, '은', '는')} 페이지만 저장되고 아직 나뉘지 않았습니다. 위에서 종류를 고른 뒤 "자동 인식 다시 분석"를 누르세요.`
 : '';
-if (st === 'busy') return '이 책은 지금 다시 분리하거나 AI로 판정하는 중입니다. 끝날 때까지 기다려 주세요.';
+if (st === 'busy') return '이 책은 지금 다시 분리·AI 판정·저장 공간 정리 중입니다. 끝날 때까지 기다려 주세요.';
 if (st === 'processing') return '이 책은 지금 처리 중입니다 (다른 창일 수 있습니다). 처리가 끝난 뒤 새로고침하세요.';
 if (st === 'stopped' && at) {
 return `부분 처리된 책입니다: ${KIND_LABEL[at.kind] || '문제집'} ${pages}까지 저장했습니다. 목록의 "보기"를 눌러 문제를 하나씩 확인하세요. 마지막 페이지의 항목은 다음 쪽에서 이어질 수 있습니다.${todo}`;
@@ -236,7 +249,7 @@ return `부분 처리된 책입니다: ${KIND_LABEL[at.kind] || '문제집'} ${p
 if (st === 'error' || st === 'interrupted') {
 const pc = b.pageCounts || {};
 return `${st === 'error' ? '처리 중 오류로' : '처리 도중'} 멈춘 책입니다 (문제집 ${pc.problem || 0}쪽, 해설지 ${pc.solution || 0}쪽 저장됨).`
-+ (todo || ' 분리된 문제가 모자라면 "이 종류 전체 다시 분리"를 누르세요.')
++ (todo || ' 분리된 문제가 모자라면 "자동 인식 다시 분석"를 누르세요.')
 + (st === 'error' && b.ingest.error ? ` (오류: ${b.ingest.error})` : '');
 }
 return todo.trim();
@@ -252,7 +265,13 @@ if (!rv.book) { $('#rv-status').textContent = ''; $('#rv-side').textContent = '�
 rv.kind = $('#rv-kind').value;
 $('#rv-status').textContent = ingestNotice(rv.book, await db.kindCounts(id));
 rv.items = (await db.byBook('items', id)).filter((i) => i.kind === rv.kind);
-rv.items.sort((a, b) => (a.section - b.section) || (a.number - b.number));
+rv.items.sort(byItemOrder);
+const inferred = rv.items.filter((i) => i.detection?.inferred).length;
+const pages = (await db.byBook('pages', id)).filter((p) => p.kind === rv.kind);
+const noTextAnchor = pages.filter((p) => !(p.diagnostics?.lexicalCandidates > 0)).length;
+const quality = rv.items.length ? ` 자동 분리 ${rv.items.length}개${inferred ? ` · 번호를 시각적으로 추정 ${inferred}개` : ''}` : ' 자동 분리된 항목이 없습니다.';
+const pageHint = noTextAnchor ? ` · 번호 OCR이 약한 페이지 ${noTextAnchor}/${pages.length}쪽은 여백·레이아웃으로 보완했습니다.` : '';
+$('#rv-status').textContent = [$('#rv-status').textContent, quality + pageHint].filter(Boolean).join(' ');
 const n = rv.book.pageCounts?.[rv.kind] || 0;
 $('#rv-pages').textContent = n;
 rv.page = n ? Math.min(Math.max(1, rv.page), n) : 0;
@@ -275,6 +294,14 @@ const ctx = cv.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, 1, 1
 $('#rv-side').textContent = n ? '페이지를 불러오지 못했습니다.' : '저장된 페이지가 없습니다.';
 return;
 }
+if (rv.rec.image == null) {
+// 백업에서 이미지가 빠진 쪽: 문제 카드와 번호·난이도는 그대로 쓰고 고칠 수 있지만, 원본 위에서 영역을 고칠 수는 없다
+rv.img = null; rv.imageData = null;
+if (rv.sel && !rv.items.some((x) => x.id === rv.sel.id && x.fragments.some((f) => f.page === rv.page))) rv.sel = null;
+cv.width = cv.height = 1;
+renderSide(); // 안내 문구 (+ 목록·분류 화면에서 고른 항목의 번호 편집)
+return;
+}
 rv.img = await loadImage(rv.rec.image);
 cv.width = rv.img.naturalWidth; cv.height = rv.img.naturalHeight;
 const ctx = cv.getContext('2d', { willReadFrequently: true });
@@ -289,6 +316,7 @@ for (const it of rv.items) it.fragments.forEach((f, fi) => { if (f.page === rv.p
 return out;
 }
 function drawOverlay() {
+if (!rv.img) return; // 이미지가 없는 쪽
 const cv = $('#rv-canvas');
 const ctx = cv.getContext('2d');
 ctx.drawImage(rv.img, 0, 0);
@@ -301,7 +329,7 @@ const hue = (it.number * 67) % 360;
 ctx.strokeStyle = selected ? '#e00' : `hsl(${hue},70%,45%)`;
 ctx.lineWidth = selected ? 5 : 3;
 ctx.strokeRect(f.x0, f.y0, f.x1 - f.x0, f.y1 - f.y0);
-const label = (rv.items.some((x) => x.section > 1) ? itemKey(it) : String(it.number)) + (f.cont ? ' (이어짐)' : '');
+const label = (it.label || rv.items.some((x) => x.section > 1) ? itemKey(it) : String(it.number)) + (f.cont ? ' (이어짐)' : '');
 ctx.font = 'bold 26px sans-serif';
 const w = ctx.measureText(label).width + 10;
 ctx.fillStyle = selected ? '#e00' : `hsl(${hue},70%,45%)`;
@@ -328,7 +356,8 @@ alert('이 책은 지금 분리 중이라 영역을 고칠 수 없습니다. 끝
 return true;
 }
 $('#rv-canvas').addEventListener('mousedown', (ev) => {
-if (!rv.rec || segmentingNow()) return;
+if (!rv.rec || !rv.img || segmentingNow()) return;
+$('#rv-canvas').focus();
 const p = canvasPoint(ev);
 const hit = fragsOnPage().reverse().find(({ f }) => p.x >= f.x0 && p.x <= f.x1 && p.y >= f.y0 && p.y <= f.y1);
 if (hit) { rv.sel = { id: hit.it.id, fi: hit.fi }; drawOverlay(); renderSide(); return; }
@@ -346,24 +375,30 @@ const d = rv.drag; rv.drag = null;
 const box = { x0: Math.min(d.x0, d.x1), y0: Math.min(d.y0, d.y1), x1: Math.max(d.x0, d.x1), y1: Math.max(d.y0, d.y1) };
 drawOverlay();
 if (box.x1 - box.x0 < 15 || box.y1 - box.y0 < 15) { rv.sel = null; drawOverlay(); renderSide(); return; }
-const input = prompt('이 영역의 번호를 입력하세요.\n이미 있는 번호면 그 항목에 이어붙입니다. (단원이 여러 개면 "2-15" 형식)');
+// 선택해 둔 항목이 있으면 그 번호를 미리 채운다: 확인만 누르면 그 항목(예제·유제 포함)에 이어붙는다
+const selected = rv.sel && rv.items.find((x) => x.id === rv.sel.id);
+const input = prompt('이 영역의 번호를 입력하세요.\n이미 있는 번호면 그 항목에 이어붙입니다. (단원이 여러 개면 "2-15", 예제·유제는 "유제 1-2" 형식)', selected ? itemKey(selected) : '');
 if (!input) return;
-const m = input.trim().match(/^(?:(\d+)\s*-\s*)?(\d+)$/);
-if (!m) return alert('번호 형식이 올바르지 않습니다.');
-const section = m[1] ? +m[1] : 1, number = +m[2];
+const m = input.trim().match(/^(예제|유제|연습\s*문제)?\s*(?:(\d+)\s*-\s*)?(\d+)$/);
+if (!m) return alert('번호 형식이 올바르지 않습니다. (예: 15, 2-15, 유제 1-2)');
+const label = m[1] ? m[1].replace(/\s+/g, '') : '';
+const section = m[2] ? +m[2] : 1, number = +m[3];
 if (section < 1 || number < 1) return alert('단원과 번호는 1 이상이어야 합니다.');
 const t = trimBox(rv.imageData, box) || box;
 const frag = { page: rv.page, ...t };
-let it = rv.items.find((x) => x.section === section && x.number === number);
+let it = rv.items.find((x) => (x.label || '') === label && x.section === section && x.number === number);
 if (it) {
-it.fragments.push(frag);
-it.fragments.sort((a, b) => (a.page - b.page) || (a.x0 - b.x0) || (a.y0 - b.y0));
+const fragments = [...it.fragments, frag].sort((a, b) => (a.page - b.page) || (a.x0 - b.x0) || (a.y0 - b.y0));
+if (!await canRecrop(it, fragments)) return; // 원본 이미지가 없는 쪽에 걸친 항목은 다시 자를 수 없다
+it.fragments = fragments;
 } else {
-it = { id: db.uid(rv.kind[0]), bookId: rv.book.id, kind: rv.kind, section, number, fragments: [frag], manual: true };
+it = { id: db.uid(rv.kind[0]), bookId: rv.book.id, kind: rv.kind, section, number, ...(label ? { label } : {}), fragments: [frag], manual: true };
 rv.items.push(it);
 }
-await saveItem(it, true);
-rv.sel = { id: it.id, fi: it.fragments.indexOf(frag) };
+if (!await saveItem(it, true)) { await reloadReviewItems(); drawOverlay(); renderSide(); return; }
+const saved = rv.items.find((x) => x.id === it.id);
+const fi = saved ? saved.fragments.findIndex((f) => f.page === frag.page && f.x0 === frag.x0 && f.y0 === frag.y0) : -1;
+rv.sel = fi >= 0 ? { id: it.id, fi } : null;
 drawOverlay(); renderSide();
 });
 window.addEventListener('keydown', async (ev) => {
@@ -375,26 +410,68 @@ if (ae && ae !== document.body && ae !== $('#rv-canvas')) return;
 ev.preventDefault();
 await deleteFragment();
 });
-const CROP_FIELDS = ['section', 'number', 'fragments', 'image', 'imageFormat', 'w', 'h', 'text', 'pageHeight', 'scale', 'manual'];
-async function saveItem(it, relinkAfter) {
-if (editLocked()) return;
+const CROP_FIELDS = ['section', 'number', 'detection', 'fragments', 'image', 'imageId', 'imageFormat', 'imageBytes', 'w', 'h', 'text', 'pageHeight', 'scale', 'manual'];
+/** 저장소의 기록으로 검토 목록을 다시 읽는다 (저장하지 못한 화면 속 수정은 버려진다) */
+async function reloadReviewItems() {
+rv.items = (await db.byBook('items', rv.book.id)).filter((i) => i.kind === rv.kind);
+rv.items.sort(byItemOrder);
+renderReviewList();
+}
+/**
+* 고친 항목을 저장한다. recrop=false면 번호·라벨만 바꾼다 (자르기 이미지는 번호와 무관하므로 그대로 둔다 — 원본 이미지가 없는 쪽의 문제도 번호를 고칠 수 있도록).
+* 반환: 저장했으면 true
+*/
+async function saveItem(it, relinkAfter, { recrop = true } = {}) {
+if (editLocked()) return false;
 buildFiltersStale = true; // 글자·연결이 바뀌면 자동 유형도 바뀔 수 있다
-await finalizeItem(it, rv.cache, null, rv.book.options?.scale || DEFAULT_OPTIONS.scale);
+if (!recrop) {
+const saved = await db.update('items', it.id, (fresh) => {
+fresh.section = it.section; fresh.number = it.number; fresh.detection = it.detection;
+if (it.label) fresh.label = it.label; else delete fresh.label;
+});
+if (saved && relinkAfter) await relink(rv.book.id);
+await reloadReviewItems();
+return !!saved;
+}
+try { await finalizeItem(it, rv.cache, null, rv.book.options?.scale || DEFAULT_OPTIONS.scale); }
+catch (e) {
+await reloadReviewItems(); // 화면에서 바꾼 영역을 저장된 상태로 되돌린다
+if (e?.name === 'PageImageMissingError') { alert(e.message); return false; }
+throw e;
+}
 // 영역·이미지만 고쳐 쓴다 (그사이 AI 판정·유형 지정으로 바뀐 값을 덮어쓰지 않도록)
 const fields = [...CROP_FIELDS, it.kind === 'problem' ? 'points' : 'answer'];
-const saved = await db.update('items', it.id, (fresh) => { for (const k of fields) if (k in it) fresh[k] = it[k]; });
+let superseded = null;
+try {
+const saved = await db.update('items', it.id, (fresh) => { superseded = fresh.image; for (const k of fields) if (k in it) fresh[k] = it[k]; });
 if (!saved) await db.put('items', it); // 새로 그린 항목
+} catch (e) {
+await M.assets.removeRef(it.image).catch(() => {}); // 저장하지 못한 새 자르기 파일은 남기지 않는다
+throw e;
+}
+// 새 자르기가 저장된 뒤에만, 이 기록이 가리키던 옛 외부 파일을 지운다
+if (M.assets.isRef(superseded) && superseded.file !== it.image?.file) await M.assets.removeRef(superseded).catch(() => {});
 if (relinkAfter) await relink(rv.book.id);
-rv.items = (await db.byBook('items', rv.book.id)).filter((i) => i.kind === rv.kind);
-rv.items.sort((a, b) => (a.section - b.section) || (a.number - b.number));
-renderReviewList();
+await reloadReviewItems();
+return true;
+}
+/** 조각을 바꾸기 전에: 바뀐 조각들이 원본 이미지가 없는 쪽에 걸치면 알리고 false */
+async function canRecrop(it, fragments) {
+if (it.image == null) return true; // 원래 이미지가 없던 항목은 읽을 수 있는 쪽으로라도 다시 자른다
+const missing = await pagesWithoutImage(it.bookId, it.kind, fragments);
+if (!missing.length) return true;
+alert(new PageImageMissingError(missing).message);
+return false;
 }
 async function deleteFragment() {
 const it = rv.items.find((x) => x.id === rv.sel?.id);
 if (!it || editLocked()) return;
 // 마지막 영역이면 항목(난이도·유형 판정 포함)이 통째로 지워지므로 한 번 묻는다
 if (it.fragments.length === 1 && !confirm(`${itemKey(it)}번의 마지막 영역입니다. 지우면 이 ${it.kind === 'problem' ? '문제' : '해설'}가 통째로 삭제됩니다. 삭제할까요?`)) return;
-it.fragments.splice(rv.sel.fi, 1);
+const rest = it.fragments.filter((_, i) => i !== rv.sel.fi);
+// 남는 영역이 원본 이미지가 없는 쪽에 걸치면 다시 자를 수 없다 (그 쪽 부분이 사라지므로 막는다)
+if (rest.length && !await canRecrop(it, rest)) return;
+it.fragments = rest;
 rv.sel = null;
 if (!it.fragments.length) await deleteItem(it);
 else await saveItem(it, false);
@@ -403,30 +480,47 @@ drawOverlay(); renderSide();
 async function deleteItem(it) {
 if (editLocked()) return;
 buildFiltersStale = true;
-await db.del('items', it.id);
+const removed = await db.take('items', it.id); // 지운 기록의 현재 이미지(외부 파일)를 정리한다
+if (M.assets.isRef(removed?.image)) await M.assets.removeRef(removed.image).catch(() => {});
 rv.items = rv.items.filter((x) => x.id !== it.id);
 rv.sel = null;
 await relink(rv.book.id);
 renderReviewList();
 }
+// 백업에서 이미지가 빠진 쪽 안내 (문제 카드와 번호·난이도·유형은 그대로 쓰고 고칠 수 있다)
+const IMAGELESS_NOTICE = '이 쪽은 백업할 때 이미지를 읽지 못해 원본을 보여 줄 수 없습니다. 문제 카드는 그대로 쓸 수 있고 번호·난이도·유형도 고칠 수 있지만, 이 쪽에 걸친 영역은 고칠 수 없습니다. 온전한 백업을 가져오면 다시 볼 수 있습니다.';
+const LABELS = ['예제', '유제', '연습문제'];
 async function renderSide() {
 const side = $('#rv-side');
+const notice = rv.rec && rv.rec.image == null ? el('p', { class: 'badge warn' }, IMAGELESS_NOTICE) : null;
 const it = rv.sel && rv.items.find((x) => x.id === rv.sel.id);
 if (!it) {
-side.replaceChildren(el('p', {}, `이 쪽의 영역: ${fragsOnPage().length}개`), el('p', { class: 'hint' }, '상자를 클릭하면 상세 정보가 여기에 표시됩니다.'));
+side.replaceChildren(...[notice, el('p', {}, `이 쪽의 영역: ${fragsOnPage().length}개`), el('p', { class: 'hint' }, '상자를 클릭하면 상세 정보가 여기에 표시됩니다.')].filter(Boolean));
 return;
 }
 const sec = el('input', { type: 'number', value: it.section, min: 1 });
 const num = el('input', { type: 'number', value: it.number, min: 1 });
+// 번호 체계: 본문 번호와 예제·유제·연습문제는 따로 센다 (잘못 들어간 체계를 옮길 수 있도록)
+const lab = el('select', { 'aria-label': '번호 체계' }, opt('', '본문 번호', !it.label), ...LABELS.map((l) => opt(l, l, it.label === l)));
 const kids = [
+notice,
 el('h3', {}, `${rv.kind === 'problem' ? '문제' : '해설'} ${itemKey(it)}`),
-el('div', { class: 'row' }, '단원 ', sec, ' 번호 ', num,
+el('div', { class: 'row' }, lab, ' 단원 ', sec, ' 번호 ', num,
 el('button', { onclick: async () => {
-const s = Number(sec.value), n = Number(num.value);
+const s = Number(sec.value), n = Number(num.value), L = lab.value;
 if (!Number.isInteger(s) || s < 1 || !Number.isInteger(n) || n < 1) return alert('단원과 번호는 1 이상의 정수로 입력하세요.');
-if (rv.items.some((x) => x !== it && x.section === s && x.number === n)
-&& !confirm(`${s}-${n}번 항목이 이미 있습니다. 그래도 같은 번호로 저장할까요?\n(영역을 합치려면 빈 곳을 드래그한 뒤 그 번호를 입력하세요.)`)) return;
-it.section = s; it.number = n; await saveItem(it, true); drawOverlay(); renderSide();
+const key = itemKey({ label: L, section: s, number: n });
+if (rv.items.some((x) => x !== it && (x.label || '') === L && x.section === s && x.number === n)
+&& !confirm(`${key}번 항목이 이미 있습니다. 그래도 같은 번호로 저장할까요?\n(영역을 합치려면 빈 곳을 드래그한 뒤 그 번호를 입력하세요.)`)) return;
+// 사용자가 확인한 번호: '번호 추정' 표시를 없애고, 다시 분석해도 같은 자리의 문제에 이 번호를 유지한다
+if (it.section !== s || it.number !== n || (it.label || '') !== L || it.detection?.inferred) {
+const { ocrNumber, ...rest } = it.detection || {};
+it.detection = { ...rest, inferred: false, numberManual: true };
+}
+it.section = s; it.number = n;
+if (L) it.label = L; else delete it.label;
+// 번호만 바뀌므로 다시 자르지 않는다 (자르기 이미지는 그대로)
+await saveItem(it, true, { recrop: false }); drawOverlay(); renderSide();
 } }, '저장')),
 it.image ? el('img', { src: it.image }) : null,
 el('div', { class: 'row' },
@@ -437,17 +531,18 @@ if (rv.kind === 'problem') {
 const sol = it.solutionId ? await db.get('items', it.solutionId) : null;
 kids.push(el('p', {}, '난이도: ', gradeBadge(it)), gradeEditor(it, () => renderSide()));
 kids.push(el('p', {}, '정답: ', it.answer ?? '-'));
-kids.push(el('h4', {}, '연결된 해설'), sol?.image ? el('img', { src: sol.image }) : el('p', { class: 'badge warn' }, '연결된 해설 없음'));
+kids.push(el('h4', {}, '연결된 해설', it.solutionInferred && sol ? el('span', { class: 'badge warn' }, ' 추정 연결 · 확인 필요') : null),
+sol?.image ? el('img', { src: sol.image }) : el('p', { class: 'badge warn' }, '연결된 해설 없음'));
 }
 if (it.text) kids.push(el('details', {}, el('summary', {}, '인식된 텍스트'), el('pre', { style: 'white-space:pre-wrap;font-size:12px' }, it.text)));
-side.replaceChildren(...kids);
+side.replaceChildren(...kids.filter(Boolean)); // 빈 칸(null)이 "null" 글자로 들어가지 않도록
 }
 function gradeBadge(p) {
 const g = effectiveGrade(p);
 return el('span', { class: 'badge' + (g == null ? ' warn' : '') }, g == null ? '미판정' : `${g}등급 (${gradeSource(p)})`);
 }
 function gradeEditor(p, after) {
-const s = el('select', {}, opt('', '수동 지정 안 함'), ...[1, 2, 3, 4, 5, 6, 7, 8, 9].map((g) => opt(g, `${g}등급`, p.gradeManual === g)));
+const s = el('select', { 'aria-label': '난이도 직접 지정' }, opt('', '수동 지정 안 함'), ...[1, 2, 3, 4, 5, 6, 7, 8, 9].map((g) => opt(g, `${g}등급`, p.gradeManual === g)));
 s.addEventListener('change', async () => {
 p.gradeManual = s.value ? +s.value : null;
 await db.update('items', p.id, (fresh) => { fresh.gradeManual = p.gradeManual; });
@@ -463,8 +558,18 @@ el('div', { class: 'row' },
 el('b', {}, itemKey(it)),
 el('span', { class: 'hint' }, `p.${it.fragments.map((f) => f.page).join(',')}`),
 rv.kind === 'problem' ? gradeBadge(it) : null,
+it.detection?.inferred ? el('span', {
+class: 'badge warn',
+title: it.detection.ocrNumber != null
+? `OCR은 ${it.detection.ocrNumber}번으로 읽었지만 앞뒤 문제 배치와 맞지 않아, 순서대로 번호를 추정했습니다. 틀렸으면 원본에서 번호를 고치세요.`
+: '문제 번호를 OCR로 읽지 못해 페이지 여백과 배치로 경계를 찾고 번호를 추정했습니다.',
+}, it.detection.ocrNumber != null ? `번호 추정 (OCR ${it.detection.ocrNumber})` : '번호 추정') : null,
 rv.kind === 'problem' && !it.solutionId ? el('span', { class: 'badge warn' }, '해설 없음') : null,
-el('button', { onclick: async () => { rv.page = it.fragments[0].page; rv.sel = { id: it.id, fi: 0 }; await showPage(); $('#rv-canvas').scrollIntoView({ behavior: 'smooth' }); } }, '보기')),
+rv.kind === 'problem' && it.solutionId && it.solutionInferred ? el('span', { class: 'badge warn', title: '번호를 추정한 문제·해설끼리 이었습니다. 맞는 해설인지 확인하세요. (이 연결의 정답은 자동으로 옮기지 않습니다)' }, '해설 추정 연결') : null,
+el('button', { onclick: async () => {
+$('#rv-editor').open = true;
+rv.page = it.fragments[0].page; rv.sel = { id: it.id, fi: 0 }; await showPage(); $('#rv-canvas').scrollIntoView({ behavior: 'smooth' });
+} }, '원본에서 보기·수정')),
 it.image ? el('img', { src: it.image, loading: 'lazy' }) : null)));
 }
 $('#rv-book').addEventListener('change', () => { rv.page = 1; loadReview(); });
@@ -485,7 +590,7 @@ const kind = rv.kind;
 if (await isBusyElsewhere(rv.book.id)) return alert('이 책은 지금 처리 중(분리·AI 판정)입니다. 끝난 뒤 다시 분리하세요.');
 // 다른 창에서 바뀌었을 수 있으니 저장소의 최신 기록으로 작업한다
 const book = (await db.get('books', rv.book.id)) || rv.book;
-if (!confirm('이 종류의 문제 영역을 처음부터 다시 나눕니다. 직접 그린 영역은 사라지지만, 같은 번호 문제에 매긴 난이도·유형(직접 지정·AI)은 유지됩니다. 다시 분리할까요?\n분리 설정은 책 추가 탭의 "고급 설정" 값을 사용합니다.')) return;
+if (!confirm('이 종류의 문제 영역을 처음부터 다시 나눕니다. 직접 그린 영역은 사라지지만, 페이지의 같은 자리에 있는 문제에 매긴 난이도·유형(직접 지정·AI)과 직접 고친 번호·정답은 유지됩니다. 다시 분리할까요?\n분리 설정은 책 추가 탭의 "고급 설정" 값을 사용합니다.')) return;
 const locks = ['#rv-reseg', '#rv-relink', '#rv-book', '#rv-kind'];
 for (const s of locks) $(s).disabled = true;
 busyBooks.add(book.id);
@@ -644,7 +749,7 @@ const auto = clAuto;
 const bookOrder = new Map(books.map((b, i) => [b.id, i]));
 const entries = items.filter((i) => i.kind === 'problem' && bookById(i.bookId))
 .map((p) => ({ p, book: bookById(p.bookId), ...typeOf(p, auto) }))
-.sort((a, b) => (bookOrder.get(a.p.bookId) - bookOrder.get(b.p.bookId)) || (a.p.section - b.p.section) || (a.p.number - b.p.number));
+.sort((a, b) => (bookOrder.get(a.p.bookId) - bookOrder.get(b.p.bookId)) || byItemOrder(a.p, b.p));
 if (cl.bookId && !bookById(cl.bookId)) cl.bookId = '';
 const inBook = cl.bookId ? entries.filter((e) => e.p.bookId === cl.bookId) : entries;
 if (cl.type && !inBook.some((e) => e.type === cl.type)) cl.type = '';
@@ -690,7 +795,7 @@ const keys = [...groups.keys()].sort(groupByBook ? (a, b) => bookOrder.get(a) - 
 const template = typeSelectTemplate(customTypes);
 const card = (e) => {
 const { p, book } = e;
-const num = multiSection.has(p.bookId) ? itemKey(p) : String(p.number);
+const num = p.label || multiSection.has(p.bookId) ? itemKey(p) : String(p.number);
 return el('div', { class: 'card' },
 el('div', { class: 'row' }, el('b', {}, `${book.name} ${num}번`), typeBadge(e), gradeBadge(p)),
 p.image ? el('img', { src: p.image, loading: 'lazy' }) : el('span', { class: 'badge warn' }, '이미지 없음'),
@@ -780,7 +885,7 @@ async function runLLMLoop(c, book, all, limit) {
 const items = await db.byBook('items', book.id);
 const sols = new Map(items.filter((i) => i.kind === 'solution').map((s) => [s.id, s]));
 let todo = items.filter((i) => i.kind === 'problem' && i.image && (all || i.gradeLLM == null));
-todo.sort((a, b) => (a.section - b.section) || (a.number - b.number));
+todo.sort(byItemOrder);
 if (limit) todo = todo.slice(0, limit);
 stopFlag = false;
 let ok = 0, fail = 0;
@@ -828,6 +933,21 @@ $('#bd-target').append(...[1, 2, 3, 4, 5, 6, 7, 8, 9].map((g) => opt(g, `${g}등
 $('#bd-mix').append(...Object.entries(MIX_PRESETS).map(([k, v]) => opt(k, v.label)));
 let pool = [], solById = new Map(), selection = [];
 let buildFiltersStale = false;
+let bookChoice = (() => {
+try { const v = JSON.parse(localStorage.getItem('math-finder.builder.books') || 'null'); return v?.mode === 'custom' ? { mode: 'custom', ids: new Set(v.ids || []) } : { mode: 'all', ids: new Set() }; }
+catch { return { mode: 'all', ids: new Set() }; }
+})();
+function saveBookChoice() { localStorage.setItem('math-finder.builder.books', JSON.stringify({ mode: bookChoice.mode, ids: [...bookChoice.ids] })); }
+function invalidateSelection(message = '조건이 바뀌었습니다. 문제를 다시 골라 주세요.') {
+if (!selection.length) return;
+selection = []; renderSelection();
+$('#bd-info').textContent = message;
+}
+function updateBookSummary() {
+const boxes = [...$('#bd-books').querySelectorAll('input')];
+const n = boxes.filter((x) => x.checked).length;
+$('#bd-books-summary').textContent = `선택한 책 ${n}/${boxes.length}권`;
+}
 async function loadPool() {
 const items = await db.all('items');
 solById = new Map(items.filter((i) => i.kind === 'solution').map((s) => [s.id, s]));
@@ -836,6 +956,23 @@ const types = classifyItems(items);
 pool = items.filter((i) => i.kind === 'problem' && bookById(i.bookId)).map((p) => ({
 ...p, subject: p.subjectLLM || bookById(p.bookId)?.subject || '(미정)', type: types.get(p.id)?.type ?? UNCLASSIFIED,
 }));
+}
+/**
+* 고른 문제를 방금 읽은 최신 기록으로 바꿔 끼운다 (그사이 영역 수정·해설 재연결이 있었으면 새 이미지·새 해설을 쓰도록).
+* 지워졌거나 현재 조건(책·과목·유형·해설 필수 등)에 맞지 않게 된 문제가 있으면 false
+*/
+function rebindSelection() {
+if (!selection.length) return true;
+const byId = new Map(pool.map((p) => [p.id, p]));
+const fresh = selection.map((p) => byId.get(p.id));
+if (fresh.some((p) => !p)) return false;
+const o = buildOpts();
+const allowed = new Set(filterPool(pool, o).map((p) => p.id));
+if (fresh.some((p) => !allowed.has(p.id))) return false;
+// "해설 있는 문제만"이면 연결된 해설 기록이 지금도 있어야 한다
+if (o.requireSolution && fresh.some((p) => !solById.has(p.solutionId))) return false;
+selection = fresh;
+return true;
 }
 async function renderBuildFilters() {
 buildFiltersStale = false;
@@ -847,11 +984,15 @@ const bookCounts = countBy('bookId'), subjectCounts = countBy('subject'), typeCo
 const box = (sel, values, label, counts) => {
 const b = $(sel), off = unchecked(b);
 b.replaceChildren(...values.map((v) => el('label', {},
-el('input', { type: 'checkbox', value: v, checked: !off.has(v) }), ` ${label(v)} `, el('span', { class: 'hint' }, `(${counts.get(v) || 0})`))));
+el('input', { type: 'checkbox', value: v, checked: sel === '#bd-books' ? (bookChoice.mode === 'all' || bookChoice.ids.has(v)) : !off.has(v) }), ` ${label(v)} `, el('span', { class: 'hint' }, `(${counts.get(v) || 0})`))));
 };
 box('#bd-books', books.map((b) => b.id), (id) => bookById(id)?.name ?? id, bookCounts);
 box('#bd-subjects', [...subjectCounts.keys()].sort(), (s) => s, subjectCounts);
 box('#bd-types', [...typeCounts.keys()].sort(compareTypes), (t) => t, typeCounts);
+updateBookSummary();
+// 목록을 새로 읽었으니 고른 문제도 최신 기록으로 바꾼다 (지워졌거나 조건에 안 맞게 됐으면 다시 고르게 한다)
+if (!rebindSelection()) invalidateSelection('고른 문제 중 일부가 지워졌거나 수정되어 조건에 맞지 않습니다. 문제를 다시 골라 주세요.');
+else if (selection.length) renderSelection();
 }
 function buildOpts() {
 return {
@@ -864,6 +1005,23 @@ excludeSubjects: [...$('#bd-subjects').querySelectorAll('input:not(:checked)')].
 excludeTypes: [...$('#bd-types').querySelectorAll('input:not(:checked)')].map((c) => c.value),
 };
 }
+$('#bd-books').addEventListener('change', () => {
+bookChoice.mode = 'custom';
+bookChoice.ids = new Set([...$('#bd-books').querySelectorAll('input:checked')].map((x) => x.value));
+saveBookChoice(); updateBookSummary(); invalidateSelection();
+});
+$('#bd-books-all').addEventListener('click', () => {
+bookChoice = { mode: 'all', ids: new Set() }; saveBookChoice();
+for (const x of $('#bd-books').querySelectorAll('input')) x.checked = true;
+updateBookSummary(); invalidateSelection();
+});
+$('#bd-books-none').addEventListener('click', () => {
+bookChoice = { mode: 'custom', ids: new Set() }; saveBookChoice();
+for (const x of $('#bd-books').querySelectorAll('input')) x.checked = false;
+updateBookSummary(); invalidateSelection();
+});
+for (const sel of ['#bd-subjects', '#bd-types']) $(sel).addEventListener('change', () => invalidateSelection());
+for (const sel of ['#bd-target', '#bd-count', '#bd-mix', '#bd-reqsol']) $(sel).addEventListener('change', () => invalidateSelection());
 $('#bd-select').addEventListener('click', async () => {
 await loadPool();
 const o = buildOpts();
@@ -876,10 +1034,11 @@ $('#bd-info').textContent = selection.length
 renderSelection();
 });
 function renderSelection() {
+$('#bd-pdf').disabled = !selection.length;
 $('#bd-list').replaceChildren(...selection.map((p, i) => {
 const sol = solById.get(p.solutionId);
 return el('div', { class: 'card' },
-el('div', { class: 'row' }, el('b', {}, `${i + 1}번`), gradeBadge(p), el('span', { class: 'hint' }, `${bookById(p.bookId)?.name ?? ''} ${p.section > 1 ? itemKey(p) : p.number}번 · ${p.subject} · ${p.type}`),
+el('div', { class: 'row' }, el('b', {}, `${i + 1}번`), gradeBadge(p), el('span', { class: 'hint' }, `${bookById(p.bookId)?.name ?? ''} ${p.label || p.section > 1 ? itemKey(p) : p.number}번 · ${p.subject} · ${p.type}`),
 el('button', { onclick: () => {
 const next = replaceOne(selection, i, pool, buildOpts());
 if (next === selection) return alert('조건에 맞는 다른 문제가 없어 바꿀 수 없습니다.');
@@ -887,6 +1046,7 @@ selection = next; renderSelection();
 } }, '교체'),
 el('button', { onclick: () => { selection.splice(i, 1); renderSelection(); } }, '빼기')),
 el('img', { src: p.image, loading: 'lazy' }),
+sol?.image && p.solutionInferred ? el('span', { class: 'badge warn', title: '번호를 추정한 문제·해설끼리 이었습니다. ② 검토·수정에서 맞는지 확인하세요.' }, '해설 추정 연결') : null,
 sol?.image ? el('img', { class: 'sol', src: sol.image, loading: 'lazy' }) : el('span', { class: 'badge warn' }, '해설 없음'));
 }));
 }
@@ -895,6 +1055,14 @@ if (!selection.length) return alert('먼저 "문제 고르기"를 누르세요.'
 const btn = $('#bd-pdf');
 btn.disabled = true;
 try {
+// PDF를 만드는 순간의 최신 기록으로 다시 읽는다: 고른 뒤 고친 영역·다시 연결한 해설·지운 문제를 반영하고,
+// 현재 책·과목·유형 조건도 다시 확인한다.
+await loadPool();
+if (!rebindSelection()) {
+invalidateSelection('고른 문제 중 일부가 지워졌거나 수정되어 조건에 맞지 않습니다. 문제를 다시 골라 주세요.');
+return alert('고른 뒤에 문제가 지워졌거나 책·과목·유형 조건이 바뀌었습니다. "문제 고르기"를 다시 눌러 주세요.');
+}
+renderSelection();
 const target = Math.round(numIn('#bd-target', 3, 1, 9));
 const title = $('#bd-title').value.trim() || '나만의 수학 문제집';
 const doc = await buildPdf(selection.map((p) => ({ problem: p, solution: solById.get(p.solutionId), book: bookById(p.bookId) })), {
@@ -908,7 +1076,7 @@ doc.save(`${title.replace(/[\\/:*?"<>|]+/g, '_').slice(0, 80)}_${target}등급.p
 } catch (e) {
 console.error(e); alert('PDF 생성 실패: ' + friendlyError(e));
 } finally {
-btn.disabled = false;
+btn.disabled = !selection.length;
 }
 });
 const STATUS_BADGE = { stopped: '부분 처리', error: '처리 오류', interrupted: '처리 중단됨', processing: '처리 중', busy: '분리·AI 판정 중' };
@@ -929,7 +1097,7 @@ const top = [...tc].sort((x, y) => ((x[0] === UNCLASSIFIED) - (y[0] === UNCLASSI
 const st = ingestState(b);
 return el('div', { class: 'bookrow' },
 el('div', {}, el('b', {}, b.name), ' ',
-STATUS_BADGE[st] ? el('span', { class: 'badge' + (['processing', 'busy'].includes(st) ? '' : ' warn'), title: b.ingest?.error || '' }, STATUS_BADGE[st]) : null, ' ',
+STATUS_BADGE[st] ? el('span', { class: 'badge' + (['processing', 'busy'].includes(st) ? '' : ' warn'), title: b.ingest?.error || '' }, storageBusy.has(b.id) ? '저장 공간 정리 중' : STATUS_BADGE[st]) : null, ' ',
 el('span', { class: 'hint' }, `${b.subject || '과목 미정'} · ${BOOK_LEVELS[b.level]?.label ?? ''}`), el('br'),
 `문제 ${probs.length} · 해설 ${mine.length - probs.length} · 해설 연결 ${probs.filter((p) => p.solutionId).length} · 난이도 ${graded} (AI ${ai})`,
 top.length ? el('div', { class: 'hint' }, `유형: ${top.map(([t, n]) => `${t} ${n}`).join(' · ')}${tc.size > top.length ? ' · …' : ''}`) : null),
@@ -948,13 +1116,78 @@ onclick: async () => {
 // 화면이 오래됐을 수 있으니 저장소의 최신 기록으로 한 번 더 확인한다
 if (await isBusyElsewhere(b.id)) { alert('이 책은 지금 처리 중입니다 (다른 창일 수 있습니다). 처리가 끝난 뒤 삭제하세요.'); return refreshBooks(); }
 if (!confirm(`"${b.name}"을(를) 삭제할까요? 페이지와 문제가 모두 지워집니다.`)) return;
-try { await db.deleteBook(b.id); } catch (e) { alert('삭제하지 못했습니다.\n' + friendlyError(e)); }
+try {
+const r = await db.deleteBook(b.id);
+buildFiltersStale = true;
+// 폴더 연결이 끊겨 있으면 이미지 파일은 정리 대기로 남는다 (다음에 폴더를 연결하면 자동으로 지움)
+if (r?.externalPending) alert('책을 삭제했습니다. 대용량 저장 폴더가 지금 연결되어 있지 않아 그 폴더의 이미지 파일은 아직 남아 있습니다. 라이브러리에서 "대용량 저장 폴더 연결"을 누르면 자동으로 정리됩니다.');
+} catch (e) { alert('삭제하지 못했습니다.\n' + friendlyError(e)); }
 refreshBooks();
 },
 }, '삭제')));
 }) : [el('p', { class: 'hint' }, '아직 추가된 책이 없습니다.')]));
 renderStorage();
+renderExternalStorage();
 }
+/** 대용량 외부 폴더 연결 상태 */
+function renderExternalStorage() {
+const s = M.assets.status();
+$('#lib-folder').disabled = !s.supported || s.enabled;
+$('#lib-folder-off').disabled = !s.enabled;
+$('#lib-folder-status').textContent = (!s.supported
+? '이 브라우저에서는 외부 폴더 저장을 지원하지 않습니다. 내부 저장은 Blob 압축으로 기존보다 약 25% 절약됩니다.'
+: s.needsPermission ? '전에 연결한 대용량 저장 폴더에 접근 권한이 필요합니다. "대용량 저장 폴더 연결"을 눌러 다시 허용하면 그 폴더에 저장된 이미지가 다시 보입니다. (그전까지 새 책은 브라우저 내부에 저장됩니다)'
+: s.enabled ? '대용량 폴더 사용 중: 새로 추가하는 책의 페이지와 문제 이미지를 연결한 폴더에 저장합니다. 이 폴더는 용량 확장용이며, 브라우저 데이터가 지워질 때를 대비한 백업은 별도로 내보내세요.'
+: s.connected ? '폴더는 읽을 수 있고, 새 책은 브라우저 내부에 저장합니다.'
+: '내부 저장 사용 중: 이미지가 base64 문자열이 아닌 Blob으로 저장되어 기존보다 약 25% 작습니다.')
++ (s.pendingCleanup ? ` · 삭제한 책 ${s.pendingCleanup}권의 이미지 폴더가 정리 대기 중입니다 (폴더를 다시 연결하면 자동으로 지웁니다).` : '');
+}
+$('#lib-folder').addEventListener('click', async () => {
+try {
+await M.assets.connect(); renderExternalStorage();
+const left = M.assets.status().pendingCleanup;
+alert('대용량 저장 폴더를 연결했습니다. 이제 새로 추가하는 책의 큰 이미지는 그 폴더에 저장됩니다.'
++ (left ? `\n(삭제한 책 ${left}권의 이미지 폴더는 아직 정리하지 못했습니다. 잠시 뒤 다시 연결해 보세요.)` : ''));
+} catch (e) { if (e?.name !== 'AbortError') alert('폴더를 연결하지 못했습니다.\n' + friendlyError(e)); }
+});
+$('#lib-folder-off').addEventListener('click', async () => {
+await M.assets.disconnect(); renderExternalStorage();
+});
+$('#lib-optimize').addEventListener('click', async () => {
+const btn = $('#lib-optimize');
+if (!confirm(M.assets.status().enabled
+? '기존 책의 큰 이미지도 연결한 폴더로 옮길까요? 중간에 멈춰도 옮긴 데이터는 안전하게 남습니다.'
+: '기존 책의 base64 이미지를 더 작은 Blob 저장 형식으로 바꿀까요? 보통 이미지 저장량이 약 25% 줄어듭니다.')) return;
+btn.disabled = true;
+// 책 하나씩 잠그고 옮긴다: 그 책은 옮기는 동안 삭제·다시 분리·영역 편집을 막고,
+// 이미 분리·처리 중인 책은 건너뛴다 (나중에 다시 실행하면 이어서 처리)
+let renderTimer = null;
+const renderSoon = () => { clearTimeout(renderTimer); renderTimer = setTimeout(renderLibrary, 250); }; // 책마다 다시 그리지 않고 모아서
+const acquire = async (id) => {
+if (busyBooks.has(id) || ingestControl?.bookId === id || llmBookId === id) return false;
+// 다른 창에서 처리 중인 책(저장된 처리 상태·살아 있다는 표시)도 건너뛴다
+const fresh = await db.get('books', id);
+if (!fresh || ['processing', 'busy'].includes(ingestState(fresh)) || busyBooks.has(id)) return false;
+busyBooks.add(id); storageBusy.add(id); renderSoon();
+if (rv.book?.id === id) $('#rv-reseg').disabled = true;
+return true;
+};
+const release = (id) => {
+busyBooks.delete(id); storageBusy.delete(id); renderSoon();
+if (rv.book?.id === id) $('#rv-reseg').disabled = false;
+};
+try {
+const r = await M.assets.optimizeExisting((n, total, changed) => { btn.textContent = `최적화 중 ${n}/${total} (${changed}개 변경)`; }, { acquire, release });
+alert(`저장 공간 최적화 완료: ${r.changed}/${r.total}개 이미지를 정리했습니다.`
++ (r.removedFiles ? ` 쓰이지 않는 외부 파일 ${r.removedFiles}개를 지웠습니다.` : '')
++ (r.skippedBooks ? `\n처리 중이던 책 ${r.skippedBooks}권은 건너뛰었습니다. 처리가 끝난 뒤 다시 실행하세요.` : '')
++ (r.failed ? `\n열 수 없는 이미지 ${r.failed}개는 그대로 두었습니다.` : ''));
+renderStorage();
+buildFiltersStale = true;
+} catch (e) {
+alert('최적화를 끝내지 못했습니다. 이미 바꾼 데이터는 안전하게 남아 있으며 다시 실행하면 이어집니다.\n' + friendlyError(e));
+} finally { btn.disabled = false; btn.textContent = '기존 책 저장 공간 최적화'; renderExternalStorage(); }
+});
 /** 저장 공간 사용량 (브라우저가 알려 주는 경우) */
 async function renderStorage() {
 const out = $('#lib-storage');
@@ -963,8 +1196,10 @@ const est = await navigator.storage?.estimate?.();
 if (!est) return;
 const mb = (n) => (n / 1048576 >= 1024 ? `${(n / 1073741824).toFixed(1)}GB` : `${Math.max(0.1, n / 1048576).toFixed(1)}MB`);
 const persisted = await navigator.storage.persisted?.();
-out.textContent = `저장 공간: ${mb(est.usage || 0)} 사용 / 약 ${mb(est.quota || 0)} 사용 가능`
-+ (persisted ? ' · 영구 저장 켜짐' : ' · 공간이 부족하면 브라우저가 지울 수 있으니 가끔 백업하세요');
+const quota = est.quota || 0, used = est.usage || 0;
+out.textContent = `브라우저 내부 저장: ${mb(used)} 사용 / 총 한도 약 ${mb(quota)} / 남은 공간 약 ${mb(Math.max(0, quota - used))}`
++ (persisted ? ' · 영구 저장 켜짐' : ' · 공간이 부족하면 브라우저가 지울 수 있으니 가끔 백업하세요')
++ (M.assets.status().enabled ? ' · 외부 폴더의 실제 디스크 공간은 이 한도와 별도입니다.' : '');
 } catch { /* 지원하지 않는 브라우저 */ }
 }
 // 백업 형식 2: 첫 줄은 머리글, 그다음 줄마다 기록 하나 {"s": 저장소, "v": 값}.
@@ -972,17 +1207,46 @@ out.textContent = `저장 공간: ${mb(est.usage || 0)} 사용 / 약 ${mb(est.qu
 const BACKUP_HEADER = 'math-finder-backup';
 $('#lib-export').addEventListener('click', async () => {
 const btn = $('#lib-export');
+// 폴더 권한이 없으면 폴더에 저장된 이미지를 백업에 넣을 수 없다: 이 클릭 안에서 권한을 다시 요청하고, 그래도 없으면 한 번 더 묻는다
+if (M.assets.status().needsPermission) {
+const ok = await M.assets.reconnect().catch(() => false);
+renderExternalStorage();
+if (!ok && !confirm('대용량 저장 폴더에 접근 권한이 없어, 폴더에 저장된 이미지는 백업에 넣을 수 없습니다.\n'
++ '취소를 누른 뒤 "대용량 저장 폴더 연결"로 권한을 허용하고 다시 백업하세요.\n\n'
++ '그래도 이미지 없이 백업 파일을 만들까요? (이런 백업으로는 이미지를 복원할 수 없습니다)')) return;
+}
 btn.disabled = true;
 try {
 // 문자열이 약 1,600만 자 쌓일 때마다 중간 Blob으로 넘겨 자바스크립트 메모리를 비운다
 const chunks = [];
 let parts = [JSON.stringify({ format: BACKUP_HEADER, version: 2, app: 'Math Finder', exportedAt: new Date().toISOString() }) + '\n'];
-let size = parts[0].length;
+let size = parts[0].length, skippedImages = 0, absentImages = 0;
+const skippedNames = [];
 const add = (line) => {
 parts.push(line); size += line.length;
 if (size > 16e6) { chunks.push(new Blob(parts)); parts = []; size = 0; }
 };
-for (const s of ['books', 'pages', 'items']) await db.forEach(s, (v) => add(JSON.stringify({ s, v }) + '\n'));
+const recordName = (s, v) => {
+const name = bookById(v.bookId)?.name || '책';
+return s === 'pages' ? `${name} ${KIND_LABEL[v.kind] || ''} ${v.index}쪽` : `${name} ${v.kind === 'problem' ? '문제' : '해설'} ${itemKey(v)}번`;
+};
+// Blob/외부 폴더 이미지는 내보낼 때만 data URL로 바꿔 어느 브라우저에서도 복구 가능한 백업을 만든다.
+// 폴더에서 지워졌거나 권한이 없어 못 읽는 이미지는 빼고 나머지를 모두 백업한다 (한 장 때문에 백업 전체가 막히지 않도록).
+for (const s of ['books', 'pages', 'items']) {
+for (const key of await db.keys(s)) {
+let v = await db.get(s, key);
+if (s !== 'books' && v && v.image == null) { absentImages++; skippedNames.push(recordName(s, v)); } // 이미 이미지가 없던 기록
+else if (v?.image != null && typeof v.image !== 'string') {
+try { v = { ...v, image: await M.assets.asDataURL(v.image) }; }
+catch (e) {
+skippedImages++; console.warn('백업에서 뺀 이미지', s, key, e);
+skippedNames.push(recordName(s, v));
+v = { ...v, image: null };
+}
+}
+add(JSON.stringify({ s, v }) + '\n');
+}
+}
 const blob = new Blob([...chunks, ...parts], { type: 'application/x-ndjson' });
 chunks.length = 0; parts = [];
 const a = el('a', { href: URL.createObjectURL(blob), download: `math-finder-backup-${new Date().toISOString().slice(0, 10)}.jsonl` });
@@ -990,9 +1254,15 @@ document.body.append(a); // 일부 브라우저는 문서에 붙어 있어야 �
 a.click();
 a.remove();
 setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+if (skippedImages || absentImages) {
+const what = [skippedImages ? `이미지 ${skippedImages}개는 읽을 수 없어 빼고 저장했습니다` : '', absentImages ? `원래 이미지가 없던 기록 ${absentImages}개도 이미지 없이 저장했습니다` : ''].filter(Boolean).join('. ');
+alert(`백업 파일을 만들었습니다. 다만 ${what}: ${skippedNames.slice(0, 5).join(', ')}${skippedNames.length > 5 ? ' 외' : ''}.\n`
++ (skippedImages ? '대용량 저장 폴더를 옮기거나 지우지 않았는지, 라이브러리에서 폴더가 연결되어 있는지 확인하세요. ' : '')
++ '이 백업을 이미지가 있는 라이브러리에 가져오면 빠진 이미지는 라이브러리에 있는 것을 그대로 둡니다. 빈 라이브러리에 복원하면 이미지가 빠진 쪽이 있는 책은 문제는 남지만 그 종류를 다시 분리할 수 없습니다.');
+}
 } catch (e) {
 console.error(e);
-alert('백업 파일을 만들지 못했습니다. 다른 탭을 닫아 메모리를 확보한 뒤 다시 시도하세요.\n' + friendlyError(e));
+alert('백업 파일을 만들지 못했습니다.\n' + friendlyError(e) + (db.isQuotaError(e) || /memory|메모리/i.test(String(e?.message)) ? '\n다른 탭을 닫아 메모리를 확보한 뒤 다시 시도하세요.' : ''));
 } finally {
 btn.disabled = false;
 }
@@ -1012,22 +1282,80 @@ while ((i = buf.indexOf('\n')) >= 0) { yield buf.slice(0, i); buf = buf.slice(i 
 if (buf) yield buf;
 }
 const hasId = (r) => r && typeof r === 'object' && typeof r.id === 'string' && r.id;
-// 이미지는 이 앱이 만든 data URL만 받는다 (공유된 백업이 외부 주소를 불러오게 하지 않도록)
+// 백업 안에서는 data URL, 실행 중에는 더 작은 Blob으로 저장한다.
 const isDataImage = (s) => typeof s === 'string' && s.startsWith('data:image/');
+const compactImage = (s) => isDataImage(s) ? M.assets.dataUrlToBlob(s) : null;
 const cleanRecord = {
 books: (b) => (hasId(b) ? { ...b, name: b.name || '이름 없는 책', createdAt: b.createdAt || new Date(0).toISOString(), pageCounts: b.pageCounts || { problem: 0, solution: 0 } } : null),
-pages: (p) => (hasId(p) && p.bookId && isDataImage(p.image) ? p : null),
-items: (it) => (hasId(it) && it.bookId && Array.isArray(it.fragments) && (it.image == null || isDataImage(it.image)) ? it : null),
+pages: (p) => {
+if (!hasId(p) || !p.bookId) return null;
+// 백업할 때 읽지 못해 빠진 쪽 이미지: 쪽 기록(글줄·단 정보)은 남긴다. 이 쪽이 있는 종류는 다시 분리하지 않아 문제가 지워지지 않는다.
+if (p.image == null) return { ...p, image: null, imageBytes: 0, imageMissing: true };
+const image = compactImage(p.image);
+return image ? { ...p, image, imageBytes: image.size, imageId: db.uid('i') } : null;
+},
+items: (it) => {
+if (!hasId(it) || !it.bookId || !Array.isArray(it.fragments)) return null;
+if (it.image == null) return it;
+const image = compactImage(it.image);
+return image ? { ...it, image, imageBytes: image.size, imageId: db.uid('i') } : null;
+},
 };
 const isStoreName = (s) => Object.prototype.hasOwnProperty.call(cleanRecord, s);
+// 이미지와 한 묶음인 값: 쪽은 이미지 자체, 문제·해설은 그 이미지가 보여 주는 영역과 글자까지
+const IMAGE_FIELDS = ['image', 'imageId', 'imageFormat', 'imageBytes'];
+const CROP_FIELDS_BY_STORE = { pages: ['width', 'height'], items: ['fragments', 'w', 'h', 'text', 'pageHeight', 'scale'] };
+/**
+* 백업에 이미지가 없는 기록(내보낼 때 폴더 권한이 없었거나 파일을 못 읽음)이 라이브러리의 같은 기록을 덮어쓸 때는
+* 라이브러리에 있는 이미지(와 그 이미지가 보여 주는 영역)를 그대로 둔다. 나머지 값(번호·난이도·유형 등)은 백업 것을 쓴다.
+*/
+function keepLiveImage(s, v, old) {
+if (v.image != null || old?.image == null) return v;
+const kept = { ...v };
+delete kept.imageMissing;
+for (const k of [...IMAGE_FIELDS, ...(CROP_FIELDS_BY_STORE[s] || [])]) { if (k in old) kept[k] = old[k]; else delete kept[k]; }
+return kept;
+}
+/**
+* 가져온 기록을 저장한다. 같은 id의 기록을 새 이미지로 덮어쓰면 그 기록이 쓰던 외부 폴더 파일은 저장이 끝난 뒤 지운다
+* (같은 백업을 여러 번 가져와도 폴더에 옛 파일이 쌓이지 않도록). 저장에 실패하면 이번에 쓴 파일을 지운다.
+* 반환: { kept: 라이브러리 이미지를 지킨 수, missing: 이미지 없이 들어온 수 }
+*/
+async function putReplacing(s, list) {
+const before = s === 'books' ? [] : await Promise.all(list.map((v) => db.get(s, v.id).catch(() => null)));
+const merged = s === 'books' ? list : list.map((v, i) => keepLiveImage(s, v, before[i]));
+try { await db.putMany(s, merged); }
+catch (e) { await M.assets.removeRefs(list.map((v) => v.image).filter(M.assets.isRef)).catch(() => {}); throw e; }
+// 새 이미지가 들어와 바뀐 기록의 옛 파일만 지운다 (이미지 없이 들어온 기록은 위에서 옛 이미지를 그대로 두었다)
+const replaced = before.map((old, i) => (M.assets.isRef(old?.image) && old.image.file !== merged[i].image?.file ? old.image : null)).filter(Boolean);
+await M.assets.removeRefs(replaced).catch(() => {});
+if (s === 'books') return { kept: 0, missing: 0 };
+return {
+kept: list.filter((v, i) => v.image == null && merged[i].image != null).length,
+missing: merged.filter((v) => v.image == null).length,
+};
+}
+/** 가져온 이미지도 지금 저장 모드로 둔다: 대용량 폴더를 쓰는 중이면 폴더 파일로(브라우저 한도를 넘는 백업도 복원되게), 아니면 Blob */
+async function placeImage(s, v) {
+if (!(v?.image instanceof Blob)) return v;
+const role = s === 'pages' ? `page-${v.kind || 'unknown'}` : `item-${v.kind || 'unknown'}`;
+const id = s === 'pages' ? v.index ?? v.id : `${v.section ?? 0}-${v.number ?? v.id}`;
+return { ...v, image: await M.assets.storeImage(v.image, { bookId: v.bookId, role, id }) };
+}
 /** 백업 가져오기. 형식 2(줄 단위)와 예전 형식(JSON 하나) 모두 읽는다. 반환: 저장소별 개수 */
 async function importBackup(file) {
-const counts = { books: 0, pages: 0, items: 0 };
+// kept: 백업에 이미지가 없어 라이브러리 이미지를 그대로 둔 기록 수, missing: 이미지 없이 들어온 기록 수
+const counts = { books: 0, pages: 0, items: 0, kept: 0, missing: 0 };
+const tally = (r) => { counts.kept += r.kept; counts.missing += r.missing; };
 try {
 const head = (await file.slice(0, 200).text()).trimStart();
 if (head.startsWith(`{"format":"${BACKUP_HEADER}"`)) {
 const batch = { books: [], pages: [], items: [] };
-const flush = async (s) => { if (batch[s].length) { await db.putMany(s, batch[s]); counts[s] += batch[s].length; batch[s] = []; } };
+const flush = async (s) => {
+if (!batch[s].length) return;
+tally(await putReplacing(s, batch[s]));
+counts[s] += batch[s].length; batch[s] = [];
+};
 let first = true;
 for await (const line of fileLines(file)) {
 if (first) { first = false; continue; }
@@ -1043,7 +1371,7 @@ const v = cleanRecord[rec.s](rec.v);
 if (!v) continue;
 // 책 기록을 먼저 저장해 두어야 도중에 실패해도 주인 없는 페이지·문제가 남지 않는다
 if (rec.s !== 'books') await flush('books');
-batch[rec.s].push(v);
+batch[rec.s].push(await placeImage(rec.s, v));
 if (batch[rec.s].length >= 50) await flush(rec.s);
 }
 for (const s of ['books', 'pages', 'items']) await flush(s);
@@ -1055,8 +1383,9 @@ if (!data || typeof data !== 'object' || !Array.isArray(data.books) || !['pages'
 throw new Error('Math Finder 백업 파일이 아닙니다.');
 }
 for (const s of ['books', 'pages', 'items']) {
-const list = (data[s] || []).map((r) => cleanRecord[s](r)).filter(Boolean);
-await db.putMany(s, list);
+const list = [];
+for (const r of data[s] || []) { const v = cleanRecord[s](r); if (v) list.push(await placeImage(s, v)); }
+tally(await putReplacing(s, list));
 counts[s] = list.length;
 }
 return counts;
@@ -1072,7 +1401,9 @@ input.value = ''; // 같은 파일을 다시 골라도 동작하도록
 if (!f) return;
 try {
 const c = await importBackup(f);
-alert(`가져오기 완료: 책 ${c.books}권, 페이지 ${c.pages}쪽, 문제·해설 ${c.items}개`);
+alert(`가져오기 완료: 책 ${c.books}권, 페이지 ${c.pages}쪽, 문제·해설 ${c.items}개`
++ (c.kept ? `\n백업에 이미지가 빠져 있던 ${c.kept}개는 라이브러리에 있던 이미지를 그대로 두었습니다.` : '')
++ (c.missing ? `\n이미지 없이 들어온 기록이 ${c.missing}개 있습니다. 그 쪽의 원본은 검토 화면에 보이지 않고, 그 종류는 다시 분리할 수 없습니다. 온전한 백업을 가져오면 채워집니다.` : ''));
 } catch (e) {
 console.error(e);
 const p = e.partial;
@@ -1084,6 +1415,10 @@ alert('가져오기 실패: ' + friendlyError(e) + done);
 buildFiltersStale = true;
 refreshBooks();
 });
-refreshBooks();
+M.assets.init().finally(() => {
+renderExternalStorage(); refreshBooks();
+// 브라우저를 다시 켜면 폴더 권한을 다시 허용해야 하는 경우가 많다. 이미지가 안 보이는 이유를 바로 알린다
+if (M.assets.status().needsPermission) toast('대용량 저장 폴더의 이미지를 보려면 라이브러리 탭에서 "대용량 저장 폴더 연결"을 눌러 권한을 다시 허용하세요.');
+});
 })();
 // ===== part3.js 끝 =====

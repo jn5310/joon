@@ -35,6 +35,10 @@ button:disabled { opacity: .5; cursor: default; }
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }
 .card { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 8px; font-size: 13px; }
 .card img { max-width: 100%; max-height: 220px; display: block; margin: 4px 0; border: 1px solid #eee; }
+.review-cards { grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }
+.review-cards .card img { width: 100%; height: auto; max-height: 420px; object-fit: contain; object-position: left top; background: #fff; }
+#rv-editor { margin-top: 18px; border-top: 1px solid #ddd; padding-top: 10px; }
+#rv-editor > summary { cursor: pointer; color: #1f3a93; }
 .card .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .card .sol { opacity: 1; }
 .badge { display: inline-block; padding: 1px 6px; border-radius: 10px; background: #e8edff; color: #1f3a93; font-size: 12px; }
@@ -42,6 +46,8 @@ button:disabled { opacity: .5; cursor: default; }
 .cols2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .box { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 12px; }
 .box h3 { margin-top: 0; }
+.storage-box { margin-bottom: 12px; }
+.storage-box .toolbar { margin-bottom: 0; }
 .hist { display: flex; gap: 6px; align-items: flex-end; height: 160px; background: #fff; padding: 10px; border: 1px solid #ddd; border-radius: 6px; }
 .hist .bar { flex: 1; background: #3b6de0; position: relative; min-height: 1px; }
 .hist .bar span { position: absolute; bottom: -18px; width: 100%; text-align: center; font-size: 12px; }
@@ -111,20 +117,26 @@ button:disabled { opacity: .5; cursor: default; }
 <div class="toolbar">
 <select id="rv-book"></select>
 <select id="rv-kind"><option value="problem">문제집</option><option value="solution">해설지</option></select>
-<button id="rv-prev">◀</button>
-<input id="rv-page" type="number" min="1" value="1" style="width:4em" /> / <span id="rv-pages">0</span>
-<button id="rv-next">▶</button>
-<button id="rv-reseg">이 종류 전체 다시 분리</button>
+<button id="rv-reseg">자동 인식 다시 분석</button>
 <button id="rv-relink">해설 다시 연결</button>
 </div>
 <p id="rv-status" class="hint"></p>
-<p class="hint">상자 클릭 = 선택 · 빈 곳 드래그 = 새 영역 추가(같은 번호를 입력하면 그 문제에 이어붙임) · 선택 후 Delete = 영역 삭제</p>
+<h3>자동 분리된 문제 <span id="rv-count"></span></h3>
+<p class="hint">페이지 여백을 빼고 문제 영역만 모았습니다. 카드만 확인하면 되며, 경계가 틀린 경우에만 아래 원본 편집기를 여세요.</p>
+<div id="rv-list" class="cards review-cards"></div>
+<details id="rv-editor">
+<summary><b>원본 페이지에서 경계 직접 수정</b> (자동 분리가 틀린 경우에만)</summary>
+<div class="toolbar">
+<button id="rv-prev">◀</button>
+<input id="rv-page" type="number" min="1" value="1" style="width:4em" /> / <span id="rv-pages">0</span>
+<button id="rv-next">▶</button>
+</div>
+<p class="hint">상자 클릭 = 선택 · 빈 곳 드래그 = 새 영역 추가(같은 번호를 입력하면 그 문제에 이어붙임. 예제·유제는 "유제 1-2"처럼 입력하고, 상자를 먼저 고르면 그 번호가 미리 채워짐) · 선택 후 Delete = 영역 삭제</p>
 <div class="review">
-<div class="viewer"><canvas id="rv-canvas"></canvas></div>
+<div class="viewer"><canvas id="rv-canvas" tabindex="0"></canvas></div>
 <aside id="rv-side" class="side"></aside>
 </div>
-<h3>분리된 항목 <span id="rv-count"></span></h3>
-<div id="rv-list" class="cards"></div>
+</details>
 </section>
 <!-- ③ 문제 분류 -->
 <section id="tab-classify" class="tab">
@@ -190,18 +202,24 @@ button:disabled { opacity: .5; cursor: default; }
 <label class="inline"><input id="bd-src" type="checkbox" checked /> 출처 표시</label>
 </div>
 <div class="form">
-<div><b>책</b><div id="bd-books" class="checks"></div></div>
+<div><b>책</b> <button id="bd-books-all" type="button">전체 선택</button> <button id="bd-books-none" type="button">전체 해제</button><div id="bd-books" class="checks"></div><p id="bd-books-summary" class="hint"></p></div>
 <div><b>과목</b><div id="bd-subjects" class="checks"></div></div>
 <div><b>유형</b><div id="bd-types" class="checks"></div></div>
 </div>
 <button id="bd-select" class="primary">문제 고르기</button>
-<button id="bd-pdf" class="primary">PDF 만들기</button>
+<button id="bd-pdf" class="primary" disabled>PDF 만들기</button>
 <p id="bd-info" class="hint"></p>
 <div id="bd-list" class="cards"></div>
 </section>
 <!-- 라이브러리 -->
 <section id="tab-library" class="tab">
 <h2>라이브러리</h2>
+<div class="box storage-box">
+<h3>대용량 저장</h3>
+<p class="hint">브라우저가 표시하는 약 10GB는 앱이 정한 제한이 아니라 브라우저·디스크의 사이트 저장 한도라 코드로 올릴 수 없습니다. 데스크톱 Chrome/Edge에서는 폴더를 연결하면 새 책의 큰 이미지가 실제 디스크에 저장되어 그 한도를 넘어 사용할 수 있습니다.</p>
+<div class="toolbar"><button id="lib-folder" class="primary">대용량 저장 폴더 연결</button><button id="lib-folder-off">새 책은 브라우저에 저장</button><button id="lib-optimize">기존 책 저장 공간 최적화</button></div>
+<p id="lib-folder-status" class="hint"></p>
+</div>
 <div id="lib-books"></div>
 <div class="toolbar">
 <button id="lib-export">전체 백업 내보내기</button>

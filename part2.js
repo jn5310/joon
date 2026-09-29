@@ -116,30 +116,124 @@ p.catch(() => { if (workerPromise === p) workerPromise = null; }); // 실패한 
 }
 return workerPromise;
 }
-/** canvas를 OCR 해서 lines [{text, x0,y0,x1,y1, firstWord}] 반환 */
-async function ocrCanvas(canvas) {
-let data;
-try {
-data = (await (await worker()).recognize(canvas)).data;
-} catch (e) {
-// 워커가 망가졌을 수 있으니 새로 띄워 한 번 더 시도한다
-await terminateOcr();
-data = (await (await worker()).recognize(canvas)).data;
+/** Tesseract 버전/출력 옵션이 달라도 line geometry를 한 형식으로 맞춘다. */
+function nestedLines(data) {
+const out = [];
+for (const b of data?.blocks || []) for (const p of b.paragraphs || []) for (const l of p.lines || []) out.push(l);
+return out;
 }
-const lines = [];
-for (const ln of data.lines || []) {
-const text = (ln.text || '').trim();
-if (!text) continue;
-const fw = ln.words && ln.words[0];
-lines.push({
-text,
-x0: ln.bbox.x0, y0: ln.bbox.y0, x1: ln.bbox.x1, y1: ln.bbox.y1,
-firstWord: fw
-? { text: fw.text, x0: fw.bbox.x0, y0: fw.bbox.y0, x1: fw.bbox.x1, y1: fw.bbox.y1 }
-: { text: text.split(/\s+/)[0], x0: ln.bbox.x0, y0: ln.bbox.y0, x1: ln.bbox.x1, y1: ln.bbox.y1 },
+function wordsToLines(words) {
+const sorted = (words || []).filter((w) => w?.bbox && String(w.text || '').trim()).slice()
+.sort((a, b) => (a.bbox.y0 - b.bbox.y0) || (a.bbox.x0 - b.bbox.x0));
+const rows = [];
+for (const w of sorted) {
+const h = Math.max(1, w.bbox.y1 - w.bbox.y0), cy = (w.bbox.y0 + w.bbox.y1) / 2;
+let row = rows.find((r) => Math.abs(r.cy - cy) < Math.max(r.h, h) * 0.55);
+if (!row) { row = { cy, h, words: [] }; rows.push(row); }
+row.words.push(w); row.cy = (row.cy * (row.words.length - 1) + cy) / row.words.length; row.h = Math.max(row.h, h);
+}
+return rows.map((r) => {
+r.words.sort((a, b) => a.bbox.x0 - b.bbox.x0);
+return { words: r.words, text: r.words.map((w) => w.text).join(' '), bbox: {
+x0: Math.min(...r.words.map((w) => w.bbox.x0)), y0: Math.min(...r.words.map((w) => w.bbox.y0)),
+x1: Math.max(...r.words.map((w) => w.bbox.x1)), y1: Math.max(...r.words.map((w) => w.bbox.y1)),
+} };
 });
 }
-return lines;
+function normalizeOcrData(data, source = 'ocr', mapPoint = (x, y) => ({ x, y })) {
+let raw = data?.lines?.length ? data.lines : nestedLines(data);
+if (!raw.length && data?.words?.length) raw = wordsToLines(data.words);
+const lines = [];
+for (const ln of raw) {
+const words = (ln.words || []).filter((w) => w?.bbox && String(w.text || '').trim()).slice().sort((a, b) => a.bbox.x0 - b.bbox.x0);
+const text = String(ln.text || words.map((w) => w.text).join(' ')).trim();
+const box = ln.bbox || (words.length ? {
+x0: Math.min(...words.map((w) => w.bbox.x0)), y0: Math.min(...words.map((w) => w.bbox.y0)),
+x1: Math.max(...words.map((w) => w.bbox.x1)), y1: Math.max(...words.map((w) => w.bbox.y1)),
+} : null);
+if (!text || !box) continue;
+const p0 = mapPoint(box.x0, box.y0), p1 = mapPoint(box.x1, box.y1);
+const first = words[0];
+let fw;
+if (first) {
+const a = mapPoint(first.bbox.x0, first.bbox.y0), b = mapPoint(first.bbox.x1, first.bbox.y1);
+fw = { text: first.text, x0: a.x, y0: a.y, x1: b.x, y1: b.y };
+} else {
+const firstText = text.split(/\s+/)[0];
+fw = { text: firstText, x0: p0.x, y0: p0.y, x1: p0.x + (p1.x - p0.x) * firstText.length / Math.max(1, text.length), y1: p1.y };
+}
+lines.push({ text, x0: p0.x, y0: p0.y, x1: p1.x, y1: p1.y, firstWord: fw, confidence: ln.confidence ?? (words.length ? words.reduce((s, w) => s + (w.confidence || 0), 0) / words.length : null), source });
+}
+return lines.sort((a, b) => (a.y0 - b.y0) || (a.x0 - b.x0));
+}
+async function recognize(canvas) {
+try { return (await (await worker()).recognize(canvas)).data; }
+catch (e) {
+// 워커가 망가졌을 수 있으니 새로 띄워 한 번 더 시도한다
+await terminateOcr();
+return (await (await worker()).recognize(canvas)).data;
+}
+}
+/** canvas를 OCR 해서 정규화된 lines 반환 */
+async function ocrCanvas(canvas) {
+return normalizeOcrData(await recognize(canvas));
+}
+/**
+* 전체 OCR에서 번호를 하나도 못 찾은 페이지는 각 단의 왼쪽 번호 영역(lane)만 잘라 한 번 더 OCR한다.
+* 본문·수식의 방해가 줄어 작은 숫자/배지의 재현율이 올라간다.
+* 단마다 따로 OCR한다: 여러 단을 옆으로 붙이면 같은 높이의 왼쪽·오른쪽 번호가 한 줄로 합쳐져 오른쪽 번호를 잃는다.
+*/
+async function ocrNumberStrips(canvas, columns) {
+if (!columns?.length) return [];
+const zoom = 1.35;
+const out = [];
+for (const col of columns) {
+const x0 = Math.max(0, Math.floor(col.x0 - 6));
+const x1 = Math.min(canvas.width, Math.ceil(col.x0 + (col.x1 - col.x0) * 0.34 + 6));
+const w = x1 - x0;
+if (w < 4) continue;
+const c = document.createElement('canvas');
+c.width = Math.max(1, Math.round(w * zoom)); c.height = Math.max(1, Math.round(canvas.height * zoom));
+const ctx = c.getContext('2d');
+if (!ctx) continue;
+ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+ctx.drawImage(canvas, x0, 0, w, canvas.height, 0, 0, c.width, c.height);
+const kx = w / c.width, ky = canvas.height / c.height;
+try {
+out.push(...normalizeOcrData(await recognize(c), 'number-strip', (x, y) => ({ x: x0 + Math.max(0, Math.min(w, x * kx)), y: y * ky })));
+} finally { c.width = c.height = 0; }
+}
+return out.sort((a, b) => (a.y0 - b.y0) || (a.x0 - b.x0));
+}
+/**
+* primary 줄 목록에 extra 줄을 더한다. 겹치는 줄은 primary를 그대로 두고(텍스트 PDF면 정확한 글자층이 primary),
+* extra가 primary 줄 바로 왼쪽의 문제 번호를 읽어 냈으면 그 번호만 줄 첫머리에 붙인다 (그림으로 된 번호·배지).
+*/
+function mergeLines(primary, extra) {
+const out = primary.slice();
+const anchorOf = (l) => M.segment?.parseAnchor?.(l) || null;
+for (const ln of extra) {
+const h = Math.max(1, ln.y1 - ln.y0);
+const at = out.findIndex((x) => {
+const xh = Math.max(1, x.y1 - x.y0);
+const overlapY = Math.min(x.y1, ln.y1) - Math.max(x.y0, ln.y0) > 0.4 * Math.min(xh, h);
+const nearX = Math.abs(x.x0 - ln.x0) < Math.max(10, xh * 2) || (ln.x0 < x.x1 && ln.x1 > x.x0);
+return overlapY && nearX;
+});
+if (at < 0) { out.push(ln); continue; }
+const body = out[at];
+const num = anchorOf(ln);
+const fw = ln.firstWord || { text: String(ln.text).split(/\s+/)[0], x0: ln.x0, y0: ln.y0, x1: ln.x0 + h, y1: ln.y1 };
+const bfw = body.firstWord || body;
+// 번호 영역 OCR(strip)은 번호만 따로 읽은 것이라 줄 첫머리와 겹쳐도 되지만, 일반 OCR은 번호가 원래 글자보다 완전히 왼쪽에 있을 때만
+// 붙인다 (첫 글자를 숫자로 잘못 읽은 OCR이 정확한 텍스트 줄을 바꾸지 않도록).
+const leftOf = ln.source === 'number-strip' ? fw.x0 <= bfw.x0 + Math.max(4, h * 0.5) : fw.x1 <= bfw.x0 + 2;
+if (num && !anchorOf(body) && leftOf) {
+const token = String(num.token || fw.text).trim();
+out[at] = { ...body, text: `${token} ${body.text}`, x0: Math.min(fw.x0, body.x0), y0: Math.min(fw.y0, body.y0), y1: Math.max(fw.y1, body.y1), firstWord: { ...fw, text: token }, confidence: ln.confidence ?? body.confidence, source: ln.source || body.source };
+}
+}
+return out.sort((a, b) => (a.y0 - b.y0) || (a.x0 - b.x0));
 }
 /** OCR 워커를 끝내 메모리를 돌려준다. 로드에 실패했거나 이미 끝난 워커여도 안전하다 */
 async function terminateOcr() {
@@ -148,7 +242,7 @@ workerPromise = null;
 if (!p) return;
 try { await (await p).terminate(); } catch { /* 이미 끝났거나 로드 실패 */ }
 }
-return { ocrCanvas, terminateOcr };
+return { ocrCanvas, ocrNumberStrips, mergeLines, normalizeOcrData, terminateOcr };
 })();
 M.llm = (() => {
 const { loadImage } = M.imaging;
@@ -180,11 +274,13 @@ ${subjectHint ? `참고: 이 책의 과목은 "${subjectHint}"입니다.
 {"grade": 정수, "subject": "과목(${SUBJECTS.join('/')} 중 하나)", "unit": "단원명", "type": "유형(위 목록 중 하나)", "answer": "정답(알 수 있으면, 없으면 null)", "reason": "한 문장 근거"}`;
 }
 /** LLM에는 원본 포맷을 유지하고, 필요할 때만 고품질 무손실로 축소한다. */
-async function shrink(dataURL, maxW = 1600) {
-const im = await loadImage(dataURL);
-const sourceMime = (dataURL.match(/^data:(image\/(?:png|jpe?g));base64,/)?.[1] || 'image/png').replace('jpg', 'jpeg');
+async function shrink(source, maxW = 1600) {
+const im = await loadImage(source);
+const sourceMime = source instanceof Blob ? (source.type || 'image/png')
+: typeof source === 'string' ? (source.match(/^data:(image\/(?:png|jpe?g));base64,/)?.[1] || 'image/png').replace('jpg', 'jpeg')
+: source?.type || 'image/png';
 const r = Math.min(1, maxW / im.naturalWidth);
-if (r === 1) return { data: dataURL.split(',')[1], mime: sourceMime };
+if (r === 1) return { data: (await M.assets.asDataURL(source)).split(',')[1], mime: sourceMime };
 const c = document.createElement('canvas');
 c.width = Math.max(1, Math.round(im.naturalWidth * r));
 c.height = Math.max(1, Math.round(im.naturalHeight * r));
@@ -316,6 +412,10 @@ document.head.appendChild(s);
 * opts: {title, subtitle, mode:'pair'|'separate', columns:1|2, zoom, answerKey, showSource}
 */
 async function buildPdf(entries, opts) {
+// jsPDF는 Blob/외부 폴더 참조를 직접 못 읽으므로 선택된 문제만 이 시점에 data URL로 변환한다.
+const materialize = async (item) => item?.image != null && typeof item.image !== 'string'
+? { ...item, image: await M.assets.asDataURL(item.image) } : item;
+entries = await Promise.all(entries.map(async (e) => ({ ...e, problem: await materialize(e.problem), solution: await materialize(e.solution) })));
 await loadScript(JSPDF_URL);
 const { jsPDF } = window.jspdf;
 const doc = new jsPDF({ unit: 'mm', format: 'a4', compress: true });
@@ -348,7 +448,7 @@ let w = (item.w / s) * PX_TO_MM * zoom;
 let h = (item.h / s) * PX_TO_MM * zoom;
 if (w > colW) { h *= colW / w; w = colW; }
 if (h > fullH()) { w *= fullH() / h; h = fullH(); }
-const fmt = item.imageFormat || (item.image.startsWith('data:image/png') ? 'PNG' : 'JPEG');
+const fmt = item.imageFormat || (typeof item.image === 'string' && item.image.startsWith('data:image/png') ? 'PNG' : 'JPEG');
 return { image: item.image, fmt, w, h };
 };
 const heightOf = (blocks) => blocks.reduce((s, b) => s + b.h + 1.5, 0);
@@ -387,12 +487,12 @@ y += 4;
 pageTop = y; // 2단일 때 첫 페이지 오른쪽 단도 제목 아래부터
 const header = (i, e) => {
 const g = effectiveGrade(e.problem);
-const num = e.problem.section > 1 ? `${e.problem.section}-${e.problem.number}` : e.problem.number;
+const num = e.problem.label || e.problem.section > 1 ? M.segment.itemKey(e.problem) : e.problem.number;
 const src = opts.showSource !== false ? `  ·  ${e.book?.name ?? ''} ${num}번` : '';
 return label(`${i + 1}번  [${g ?? '-'}등급]${src}`);
 };
 const solBlocks = (title, e) => [
-label(title + (e.problem.answer ? `   정답 ${e.problem.answer}` : ''), 24, true, '#b03a2e'),
+label(title + (e.solution && e.problem.solutionInferred ? ' (번호로 추정한 연결 · 확인 필요)' : '') + (e.problem.answer ? `   정답 ${e.problem.answer}` : ''), 24, true, '#b03a2e'),
 pic(e.solution) || label('(해설 없음)', 22, false, '#888'),
 ];
 if (opts.mode === 'separate') {
@@ -428,9 +528,9 @@ return { buildPdf };
 M.pipeline = (() => {
 const db = M.db;
 const { openPdf, renderPage, textItemsToLines } = M.pdfsource;
-const { ocrCanvas, terminateOcr } = M.ocr;
-const { detectColumns } = M.layout;
-const { segmentPages, textInFragments, matchSolutions, extractAnswer, extractPoints, itemKey } = M.segment;
+const { ocrCanvas, ocrNumberStrips, mergeLines, terminateOcr } = M.ocr;
+const { detectColumns, detectBlockStarts, columnInkBottoms } = M.layout;
+const { segmentPages, findCandidates, selectAnchors, textInFragments, matchSolutions, matchPrevious, extractAnswer, extractPoints } = M.segment;
 const { PageCache, pageId, trimFragments, cropFragments } = M.imaging;
 const DEFAULT_OPTIONS = {
 scale: 2,          // 렌더링 배율 (1 = 72dpi, 2 ≈ 144dpi)
@@ -441,7 +541,7 @@ maxSkip: 3,        // 번호 건너뛰기 허용 폭
 forceOcr: false,   // 텍스트가 있어도 OCR 강제
 };
 /** 명확한 사진성 질감만 JPEG로 저장하고, 그래프·도형처럼 애매한 페이지는 PNG를 우선한다. */
-function encodeRenderedPage(canvas, imageData) {
+async function encodeRenderedPage(canvas, imageData, asset) {
 let sampled = 0, midtone = 0, softChanges = 0, comparisons = 0;
 const toneBins = new Set(), colorBins = new Set();
 const step = Math.max(1, Math.floor(Math.sqrt((imageData.width * imageData.height) / 50000)));
@@ -468,9 +568,10 @@ const textureRatio = comparisons ? softChanges / comparisons : 0;
 const photographic = midtoneRatio > 0.12 && textureRatio > 0.12 && (
 colorBins.size > 96 || toneBins.size > 24
 );
-return photographic
-? { image: canvas.toDataURL('image/jpeg', 0.95), imageFormat: 'JPEG' }
-: { image: canvas.toDataURL('image/png'), imageFormat: 'PNG' };
+const type = photographic ? 'image/jpeg' : 'image/png';
+const format = photographic ? 'JPEG' : 'PNG';
+const blob = await M.assets.canvasToBlob(canvas, type, photographic ? 0.92 : undefined);
+return { image: await M.assets.storeImage(blob, asset), imageId: db.uid('i'), imageFormat: format, imageBytes: blob.size };
 }
 async function ingestPdf(book, kind, file, opts, log, control) {
 const doc = await openPdf(file);
@@ -488,18 +589,45 @@ const { canvas, textItems, viewport, hasText } = await renderPage(doc, p, opts.s
 const ctx = canvas.getContext('2d', { willReadFrequently: true });
 const pageImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 const columns = detectColumns(pageImageData, opts);
-let lines, ocr = false;
-if (!hasText || opts.forceOcr) {
-log(`[${kind === 'problem' ? '문제' : '해설'}] ${p}/${doc.numPages} 쪽 OCR 중...`, p / doc.numPages);
-lines = await ocrCanvas(canvas);
+const visualStarts = detectBlockStarts(pageImageData, columns, opts);
+const inkBottoms = columnInkBottoms(pageImageData, columns, opts);
+const textLines = textItemsToLines(textItems, viewport, columns);
+const basePage = { index: p, width: canvas.width, height: canvas.height, columns, lines: textLines, visualStarts, ocr: false };
+// OCR이 필요한지는 "받아들여진 문제 번호"로 판단한다. 선택지 줄(①…⑤)·소문항·본문 숫자 후보는 번호가 아니다.
+const accepted = (page) => selectAnchors(findCandidates(page, opts), opts).length;
+const label = kind === 'problem' ? '문제' : '해설';
+let lines = textLines, ocr = false, stripRetried = false, ocrSkipped = false;
+// 텍스트층이 있어도 문제 번호를 하나도 받아들이지 못하면 번호가 그림이거나 숨은/깨진 텍스트층일 수 있으므로 OCR로 보완한다.
+if (!hasText || opts.forceOcr || (accepted(basePage) === 0 && !control?.ocrUnavailable)) {
+log(`[${label}] ${p}/${doc.numPages} 쪽 OCR 중...`, p / doc.numPages);
+try {
+const ocrLines = await ocrCanvas(canvas);
+// 텍스트 PDF는 정확한 글자층을 그대로 두고, OCR에서는 글자층에 없는 줄과 그림으로 된 번호만 더한다
+lines = hasText ? mergeLines(textLines, ocrLines) : ocrLines;
 ocr = true;
-} else {
-log(`[${kind === 'problem' ? '문제' : '해설'}] ${p}/${doc.numPages} 쪽 (텍스트 PDF)`, p / doc.numPages);
-lines = textItemsToLines(textItems, viewport, columns); // 단 경계를 넘어 줄이 합쳐지지 않도록
+// 번호를 거의 못 읽었으면(여백으로 찾은 문제 시작의 절반 미만) 단마다 번호 자리만 잘라 한 번 더 읽는다
+if (visualStarts.length && accepted({ ...basePage, lines, ocr: true }) < Math.ceil(visualStarts.length / 2)) {
+log(`[${label}] ${p}/${doc.numPages} 쪽 번호 영역 정밀 OCR 중...`, p / doc.numPages);
+lines = mergeLines(lines, await ocrNumberStrips(canvas, columns));
+stripRetried = true;
 }
-const encoded = encodeRenderedPage(canvas, pageImageData);
-const meta = { id: pageId(book.id, kind, p), bookId: book.id, kind, index: p, width: canvas.width, height: canvas.height, columns, lines, ocr, imageFormat: encoded.imageFormat };
-await db.put('pages', { ...meta, image: encoded.image });
+} catch (e) {
+// 스캔 쪽은 OCR 없이는 글자가 없고, 'OCR 강제'는 사용자가 직접 요청한 것이므로 실패로 알린다.
+// 자동 보완으로 시도한 텍스트 PDF 쪽만 글자층으로 계속한다 (예: 번호 없는 개념 설명 쪽).
+if (!hasText || opts.forceOcr) throw e;
+ocrSkipped = true;
+if (control) control.ocrUnavailable = true; // 같은 처리 중에는 다시 내려받으려 하지 않는다
+log(`[${label}] ${p}/${doc.numPages} 쪽: OCR 프로그램을 쓸 수 없어 텍스트층만 사용합니다.`, p / doc.numPages);
+}
+} else {
+log(`[${label}] ${p}/${doc.numPages} 쪽 (텍스트 PDF)`, p / doc.numPages);
+}
+const encoded = await encodeRenderedPage(canvas, pageImageData, { bookId: book.id, role: `page-${kind}`, id: p });
+// lexicalCandidates: 이 쪽에서 받아들여진 문제 번호 수 (검토 화면의 "번호 OCR이 약한 페이지" 안내에 쓴다)
+const diagnostics = { lineCount: lines.length, lexicalCandidates: accepted({ ...basePage, lines, ocr }), visualCandidates: visualStarts.length, stripRetried, ...(ocrSkipped ? { ocrSkipped } : {}) };
+const meta = { id: pageId(book.id, kind, p), bookId: book.id, kind, index: p, width: canvas.width, height: canvas.height, columns, lines, visualStarts, inkBottoms, diagnostics, ocr, imageFormat: encoded.imageFormat, imageBytes: encoded.imageBytes };
+try { await db.put('pages', { ...meta, image: encoded.image, imageId: encoded.imageId }); }
+catch (e) { await M.assets.removeRef(encoded.image); throw e; } // 기록하지 못한 쪽의 외부 파일은 남기지 않는다
 metas.push(meta);
 // 쪽마다 진행 상황을 저장해 두면, 오류나 탭 종료로 끊겨도 저장된 쪽까지 검토·다시 분리할 수 있다
 book.pageCounts[kind] = metas.length;
@@ -520,48 +648,102 @@ return { metas, totalPages: doc.numPages, stopped: !!control?.stopRequested };
 }
 /** 저장된 페이지 정보로 문제 분리를 다시 수행 (옵션 변경 시에도 사용) */
 async function segmentKind(book, kind, metas, log) {
-const opts = { ...DEFAULT_OPTIONS, ...book.options, continuation: kind === 'solution' };
+// kind: 해설은 단을 넘긴 풀이를 늘 이어 붙이고, 문제는 개념 설명 단을 문제로 만들지 않는 등 규칙이 조금 다르다
+const opts = { ...DEFAULT_OPTIONS, ...book.options, continuation: true, kind };
 if (!metas) {
-metas = (await db.byBook('pages', book.id))
-.filter((p) => p.kind === kind)
-.map(({ image, ...m }) => m)
-.sort((a, b) => a.index - b.index);
+const stored = (await db.byBook('pages', book.id)).filter((p) => p.kind === kind);
+// 백업에서 이미지가 빠진 쪽이 있으면 그 쪽의 문제를 잘라낼 수 없으므로, 기존 분리 결과를 지키고 다시 분리하지 않는다
+const missing = stored.filter((p) => p.image == null).map((p) => p.index).sort((a, b) => a - b);
+if (missing.length) throw new Error(`이미지가 없는 쪽(${missing.slice(0, 10).join(', ')}${missing.length > 10 ? ' …' : ''}쪽)이 있어 다시 분리하지 않았습니다. 기존 문제는 그대로 남아 있습니다. 온전한 백업을 가져오거나 책을 다시 추가하세요.`);
+metas = stored.map(({ image, ...m }) => m).sort((a, b) => a.index - b.index);
 }
-// 옮겨 줄 판정값만 기억한다 (이미지는 버려 메모리 절약)
-const old = (await db.byBook('items', book.id)).filter((it) => it.kind === kind).map(({ image, ...rest }) => rest);
+// 옮겨 줄 판정값만 기억한다 (이미지는 버려 메모리 절약). 외부 폴더 파일 참조는 교체 뒤 지우려고 남긴다
+const old = (await db.byBook('items', book.id)).filter((it) => it.kind === kind)
+.map(({ image, ...rest }) => ({ ...rest, oldRef: M.assets.isRef(image) ? image : null }));
+const cache = new PageCache(3);
+// 이전 버전에서 저장한 페이지에는 시각 경계가 없다. 다시 PDF/OCR을 돌리지 않고 저장된 페이지 이미지에서 보완한다.
+for (const m of metas) {
+if (Array.isArray(m.visualStarts) && Array.isArray(m.inkBottoms)) continue;
+const pg = await cache.get(pageId(book.id, kind, m.index));
+if (!pg) { if (!Array.isArray(m.visualStarts)) m.visualStarts = []; continue; }
+const cols = m.columns || [{ x0: 0, x1: m.width }];
+if (!Array.isArray(m.visualStarts)) {
+m.visualStarts = detectBlockStarts(pg.imageData, cols, opts);
+m.diagnostics = { ...(m.diagnostics || {}), visualCandidates: m.visualStarts.length, upgradedVisualLayout: true };
+}
+m.inkBottoms = columnInkBottoms(pg.imageData, cols, opts);
+await db.update('pages', m.id, (fresh) => { fresh.visualStarts = m.visualStarts; fresh.inkBottoms = m.inkBottoms; fresh.diagnostics = m.diagnostics; });
+}
 const raw = segmentPages(metas, opts);
 const pagesByIndex = new Map(metas.map((m) => [m.index, m]));
-const cache = new PageCache();
 const items = [];
+// 새 항목의 외부 파일은 교체가 확정되기 전까지 임시다. 어떤 이유로든 교체하지 못하면 지운다 (기존 항목의 파일은 건드리지 않음)
+const discardNew = () => M.assets.removeRefs(items.map((it) => it.image).filter(M.assets.isRef));
+try {
 for (let i = 0; i < raw.length; i++) {
 const r = raw[i];
 log && log(`[${kind === 'problem' ? '문제' : '해설'}] ${i + 1}/${raw.length} 자르는 중`, (i + 1) / raw.length);
 const fragments = await trimFragments(cache, book.id, kind, r.fragments);
 if (!fragments.length) continue;
-const item = { id: db.uid(kind[0]), bookId: book.id, kind, section: r.section, number: r.number, fragments };
-await finalizeItem(item, cache, pagesByIndex, opts.scale);
+const item = { id: db.uid(kind[0]), bookId: book.id, kind, section: r.section, number: r.number, ...(r.label ? { label: r.label } : {}), detection: r.detection, fragments };
 items.push(item);
+await finalizeItem(item, cache, pagesByIndex, opts.scale);
 }
-// 다시 분리해도 같은 번호 문제에 매긴 난이도·유형(직접 지정·AI)과 직접 고친 정답은 유지한다
-const oldByKey = new Map(old.map((it) => [itemKey(it), it]));
+// 다시 분리해도 같은 문제에 매긴 난이도·유형(직접 지정·AI)과 직접 고친 정답은 유지한다.
+// 추정 번호는 분석마다 달라질 수 있어 번호가 아니라 페이지 위치로 같은 문제를 찾는다.
+const prevOf = matchPrevious(old, items);
 for (const item of items) {
-const prev = oldByKey.get(itemKey(item));
+const prev = prevOf.get(item);
 if (!prev) continue;
 for (const k of KEEP_ON_RESEGMENT) if (prev[k] != null) item[k] = prev[k];
 if (prev.answerManual || prev.answerLLM) Object.assign(item, { answer: prev.answer, answerManual: prev.answerManual, answerLLM: prev.answerLLM });
+// 사용자가 검토 화면에서 직접 고친 번호도 같은 자리의 문제에 그대로 둔다
+if (prev.detection?.numberManual) {
+const { ocrNumber, ...rest } = item.detection || {};
+Object.assign(item, { section: prev.section, number: prev.number, detection: { ...rest, inferred: false, numberManual: true } });
+if (prev.label) item.label = prev.label; else delete item.label;
+}
+}
+// 결과가 기존의 25% 아래로 급감하면 잘못된 설정/분석일 가능성이 높으므로 기존 결과를 지킨다.
+if (old.length >= 8 && items.length < old.length * 0.25) {
+throw new Error(`새 분리 결과가 ${items.length}개로 기존 ${old.length}개의 25%보다 적어 교체하지 않았습니다. OCR·레이아웃 분석을 다시 확인하세요.`);
 }
 // 새 항목을 다 만든 뒤 한 번에 바꾼다. 중간에 실패하면 기존 항목이 그대로 남는다
 await db.replaceItems(book.id, kind, items, old.map((it) => it.id));
+} catch (e) {
+await discardNew().catch(() => {});
+throw e;
+}
+// 교체가 저장된 뒤에만 옛 항목의 외부 파일을 지운다
+await M.assets.removeRefs(old.map((it) => it.oldRef).filter(Boolean)).catch(() => {});
 // 이 종류는 나누기를 마쳤다고 기록한다 (번호를 하나도 못 찾아 0개여도 "아직 안 나눔"과 구분)
 book.segmented = { ...(book.segmented || {}), [kind]: true };
 await db.update('books', book.id, (f) => { f.segmented = book.segmented; });
 return items;
 }
 const KEEP_ON_RESEGMENT = ['gradeManual', 'gradeLLM', 'unit', 'subjectLLM', 'llmReason', 'typeLLM', 'typeManual'];
+/** 원본 이미지가 없는 쪽(백업에서 빠진 쪽)에 걸친 항목을 다시 자르려 할 때의 오류. 기존 자르기는 그대로 둔다 */
+class PageImageMissingError extends Error {
+constructor(pages) {
+super(`원본 이미지가 없는 쪽(${pages.join(', ')}쪽)에 걸친 항목이라 영역을 다시 자를 수 없습니다. 기존 이미지는 그대로 두었습니다. (번호·난이도·유형은 고칠 수 있습니다)`);
+this.name = 'PageImageMissingError'; this.pages = pages;
+}
+}
+/** 이 조각들이 걸친 쪽 가운데 원본 이미지가 없는 쪽 번호 */
+async function pagesWithoutImage(bookId, kind, fragments) {
+const idx = [...new Set((fragments || []).map((f) => f.page))].sort((a, b) => a - b);
+const recs = await Promise.all(idx.map((i) => db.get('pages', pageId(bookId, kind, i)).catch(() => null)));
+return idx.filter((i, k) => recs[k]?.image == null);
+}
 /** 자르기 이미지 + 텍스트 + 부가정보 갱신 */
 async function finalizeItem(item, cache, pagesByIndex, scale) {
-const crop = await cropFragments(cache, item.bookId, item.kind, item.fragments);
-Object.assign(item, crop || { image: null, w: 0, h: 0 });
+// 이미 이미지가 있는 항목(검토 화면에서 고치는 경우)은 모든 쪽의 원본이 있을 때만 다시 자른다: 빠진 쪽의 부분이 사라지지 않도록
+if (item.image != null) {
+const missing = await pagesWithoutImage(item.bookId, item.kind, item.fragments);
+if (missing.length) throw new PageImageMissingError(missing);
+}
+const crop = await cropFragments(cache, item.bookId, item.kind, item.fragments, `${item.section}-${item.number}`);
+Object.assign(item, crop || { image: null, imageId: db.uid('i'), w: 0, h: 0 });
 if (!pagesByIndex) {
 const idx = [...new Set(item.fragments.map((f) => f.page))];
 const metas = (await Promise.all(idx.map((i) => db.get('pages', pageId(item.bookId, item.kind, i))))).filter(Boolean);
@@ -583,14 +765,18 @@ const items = await db.byBook('items', bookId);
 const problems = items.filter((i) => i.kind === 'problem');
 const solutions = items.filter((i) => i.kind === 'solution');
 const matched = matchSolutions(problems, solutions);
-const link = new Map(problems.map((p) => [p.id, p.solutionId]));
+const link = new Map(problems.map((p) => [p.id, { id: p.solutionId, inferred: !!p.solutionInferred }]));
 const answerOf = new Map(solutions.map((s) => [s.id, s.answer ?? null]));
 // 연결·정답만 고쳐 쓴다 (그사이 AI 판정이나 직접 지정한 값을 덮어쓰지 않도록 저장 직전 기록에 반영)
+// 추정 번호로 이은 연결(확인 필요)은 정답을 자동으로 옮기지 않는다 (틀린 해설의 정답이 빠른 정답표에 들어가지 않도록)
 await db.updateMany('items', problems.map((p) => p.id), (fresh) => {
-fresh.solutionId = link.get(fresh.id) ?? null;
-if (!fresh.answerManual && !fresh.answerLLM) fresh.answer = fresh.solutionId ? answerOf.get(fresh.solutionId) ?? null : null;
+const l = link.get(fresh.id);
+fresh.solutionId = l?.id ?? null;
+fresh.solutionInferred = !!(l?.id && l.inferred);
+if (!fresh.answerManual && !fresh.answerLLM) fresh.answer = fresh.solutionId && !fresh.solutionInferred ? answerOf.get(fresh.solutionId) ?? null : null;
 });
-return { problems: problems.length, solutions: solutions.length, matched };
+const inferredLinks = problems.filter((p) => p.solutionId && p.solutionInferred).length;
+return { problems: problems.length, solutions: solutions.length, matched, inferredLinks };
 }
 async function ingestBook({ name, subject, level, problemFile, solutionFile, options }, log, control) {
 const book = {
@@ -647,6 +833,6 @@ await terminateOcr(); // OCR 워커 메모리 해제 (다음 처리 때 다시 �
 }
 /** 다른 창에서 처리 중인 책인지 판단할 때 쓰는 기준 (이보다 오래 소식이 없으면 끊긴 것으로 본다) */
 const HEARTBEAT_STALE_MS = 5 * 60000;
-return { DEFAULT_OPTIONS, HEARTBEAT_STALE_MS, segmentKind, finalizeItem, relink, ingestBook };
+return { DEFAULT_OPTIONS, HEARTBEAT_STALE_MS, segmentKind, finalizeItem, pagesWithoutImage, PageImageMissingError, relink, ingestBook };
 })();
 // ===== part2.js 끝 =====
