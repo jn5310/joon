@@ -2,12 +2,12 @@
 var M = window.M || (window.M = {});
 M.app = (() => {
 const db = M.db;
-const { ingestBook, segmentKind, relink, finalizeItem, pagesWithoutImage, PageImageMissingError, DEFAULT_OPTIONS, HEARTBEAT_STALE_MS } = M.pipeline;
+const { ingestBook, segmentKind, relink, finalizeItem, pagesWithoutImage, PageImageMissingError, sameRegions, DEFAULT_OPTIONS, HEARTBEAT_STALE_MS } = M.pipeline;
 const { PageCache, pageId, loadImage } = M.imaging;
 const { trimBox } = M.layout;
 const { itemKey } = M.segment;
 const { BOOK_LEVELS, heuristicGrades, effectiveGrade, gradeSource } = M.grade;
-const { PROVIDERS, SUBJECTS, gradeWithLLM, loadConfig, saveConfig } = M.llm;
+const { PROVIDERS, SUBJECTS, analyzeWithLLM, toSchemaJson, numberOf, levelToGrade, loadConfig, saveConfig } = M.llm;
 const { MIX_PRESETS, filterPool, selectProblems, replaceOne } = M.select;
 const { UNCLASSIFIED, AREAS, TYPES, classifyBook, effectiveType, isStandardType, compareTypes } = M.classify;
 const { buildPdf } = M.build;
@@ -443,7 +443,12 @@ throw e;
 const fields = [...CROP_FIELDS, it.kind === 'problem' ? 'points' : 'answer'];
 let superseded = null;
 try {
-const saved = await db.update('items', it.id, (fresh) => { superseded = fresh.image; for (const k of fields) if (k in it) fresh[k] = it[k]; });
+const saved = await db.update('items', it.id, (fresh) => {
+superseded = fresh.image;
+// AI가 옮겨 적은 글은 옛 영역의 것이다: 영역이 바뀌면 '다시 판정 필요'로 표시한다 (난이도·유형은 그대로 둔다)
+if (fresh.aiExtract && !fresh.aiExtract.stale && !sameRegions(fresh.fragments, it.fragments)) fresh.aiExtract = { ...fresh.aiExtract, stale: true };
+for (const k of fields) if (k in it) fresh[k] = it[k];
+});
 if (!saved) await db.put('items', it); // 새로 그린 항목
 } catch (e) {
 await M.assets.removeRef(it.image).catch(() => {}); // 저장하지 못한 새 자르기 파일은 남기지 않는다
@@ -521,7 +526,7 @@ it.section = s; it.number = n;
 if (L) it.label = L; else delete it.label;
 // 번호만 바뀌므로 다시 자르지 않는다 (자르기 이미지는 그대로)
 await saveItem(it, true, { recrop: false }); drawOverlay(); renderSide();
-} }, '저장')),
+} }, '번호 저장')),
 it.image ? el('img', { src: it.image }) : null,
 el('div', { class: 'row' },
 el('button', { onclick: deleteFragment }, '이 영역 삭제'),
@@ -530,7 +535,18 @@ el('button', { onclick: async () => { if (confirm('항목 전체를 삭제할까
 if (rv.kind === 'problem') {
 const sol = it.solutionId ? await db.get('items', it.solutionId) : null;
 kids.push(el('p', {}, '난이도: ', gradeBadge(it)), gradeEditor(it, () => renderSide()));
-kids.push(el('p', {}, '정답: ', it.answer ?? '-'));
+// 정답: 해설에서 읽은 값을 보여 주고, 직접 입력할 수도 있다 (해설이 없거나 추정 연결인 문제의 빠른 정답용)
+const ans = el('input', { type: 'text', value: it.answer ?? '', placeholder: '예: ③, 12', 'aria-label': '정답 직접 입력', style: 'width:7em' });
+kids.push(el('div', { class: 'row' }, '정답: ', ans, el('button', { onclick: async () => {
+const v = ans.value.trim().slice(0, 40);
+await db.update('items', it.id, (f) => {
+if (v) { f.answer = v; f.answerManual = true; f.answerLLM = false; }
+else { f.answer = null; f.answerManual = false; f.answerLLM = false; } // 비우면 해설에서 다시 읽는다
+});
+if (!v) await relink(rv.book.id);
+await reloadReviewItems(); renderSide();
+} }, '정답 저장'), it.answerManual ? el('span', { class: 'hint' }, '직접 입력') : null));
+kids.push(...aiBadges(it), aiExtractView(it));
 kids.push(el('h4', {}, '연결된 해설', it.solutionInferred && sol ? el('span', { class: 'badge warn' }, ' 추정 연결 · 확인 필요') : null),
 sol?.image ? el('img', { src: sol.image }) : el('p', { class: 'badge warn' }, '연결된 해설 없음'));
 }
@@ -566,11 +582,115 @@ title: it.detection.ocrNumber != null
 }, it.detection.ocrNumber != null ? `번호 추정 (OCR ${it.detection.ocrNumber})` : '번호 추정') : null,
 rv.kind === 'problem' && !it.solutionId ? el('span', { class: 'badge warn' }, '해설 없음') : null,
 rv.kind === 'problem' && it.solutionId && it.solutionInferred ? el('span', { class: 'badge warn', title: '번호를 추정한 문제·해설끼리 이었습니다. 맞는 해설인지 확인하세요. (이 연결의 정답은 자동으로 옮기지 않습니다)' }, '해설 추정 연결') : null,
+...aiBadges(it),
 el('button', { onclick: async () => {
 $('#rv-editor').open = true;
 rv.page = it.fragments[0].page; rv.sel = { id: it.id, fi: 0 }; await showPage(); $('#rv-canvas').scrollIntoView({ behavior: 'smooth' });
 } }, '원본에서 보기·수정')),
-it.image ? el('img', { src: it.image, loading: 'lazy' }) : null)));
+it.image ? el('img', { src: it.image, loading: 'lazy' }) : null,
+aiExtractView(it))));
+}
+/** AI가 잘리거나 흐려 읽지 못한 곳을 [미상]으로 적었는지 (지문·문제·선지) */
+const hasUnreadable = (p) => [p?.passage, p?.question, ...(p?.choices || [])].some((s) => String(s ?? '').includes('[미상]'));
+/** AI 판정이 알려 주는 자르기·번호 확인 표시 (한 영역에 문제 여러 개, 안 보이는 부분, 번호 다름, 영역을 고친 뒤 다시 판정 필요) */
+function aiBadges(it) {
+const ex = it.kind === 'problem' ? it.aiExtract : null;
+if (!ex?.problems?.length) return [];
+const main = ex.problems[ex.primary] || ex.problems[0];
+const n = numberOf(main.problem_number);
+return [
+ex.problems.length > 1 ? el('span', { class: 'badge warn', title: 'AI가 이 영역에서 문제를 여러 개 읽었습니다. 두 문제가 한 영역으로 합쳐졌을 수 있으니 원본에서 확인하세요.' }, `AI: 문제 ${ex.problems.length}개`) : null,
+hasUnreadable(main) ? el('span', { class: 'badge warn', title: 'AI가 잘리거나 흐려서 읽지 못한 부분을 [미상]으로 적었습니다. 영역이 잘리지 않았는지 원본에서 확인하세요.' }, 'AI: 안 보이는 부분 있음') : null,
+n != null && n !== it.number ? el('span', { class: 'badge warn', title: 'AI가 이미지에서 읽은 번호가 이 항목의 번호와 다릅니다. 번호를 확인하세요.' }, `AI가 읽은 번호 ${main.problem_number}`) : null,
+ex.stale ? el('span', { class: 'badge warn', title: '영역을 고친 뒤라 AI가 옮겨 적은 글이 지금 영역과 다를 수 있습니다. ④ 난이도 탭에서 "아직 안 한 문제만"으로 다시 판정하세요.' }, 'AI 다시 판정 필요') : null,
+];
+}
+// 수식 미리보기 (KaTeX). 처음 필요할 때만 불러오고, 못 불러오면(인터넷 없음 등) LaTeX 글자를 그대로 둔다
+const KATEX_BASE = 'https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/';
+let katexLoading = null;
+function loadKatex() {
+if (window.renderMathInElement) return Promise.resolve();
+if (!katexLoading) {
+const script = (src) => new Promise((resolve, reject) => {
+const s = document.createElement('script');
+s.src = src; s.onload = resolve;
+s.onerror = () => { s.remove(); reject(new Error('KaTeX 로드 실패')); };
+document.head.append(s);
+});
+// 스타일시트도 다 받은 뒤에 그린다 (스타일 없이 그리면 수식이 두 번 겹쳐 보인다). 실패한 <link>는 지워 다음에 다시 받게 한다
+const style = () => {
+const old = document.querySelector('link[data-katex]');
+if (old?.sheet) return Promise.resolve();
+old?.remove();
+return new Promise((resolve, reject) => {
+const l = el('link', { rel: 'stylesheet', href: KATEX_BASE + 'katex.min.css', 'data-katex': '' });
+l.onload = resolve;
+l.onerror = () => { l.remove(); reject(new Error('KaTeX 스타일 로드 실패')); };
+document.head.append(l);
+});
+};
+const p = (async () => {
+await style();
+if (!window.katex) await script(KATEX_BASE + 'katex.min.js');
+await script(KATEX_BASE + 'contrib/auto-render.min.js');
+})();
+katexLoading = p;
+p.catch(() => { if (katexLoading === p) katexLoading = null; }); // 실패한 로드는 기억하지 않고 다음에 펼칠 때 다시 시도
+}
+return katexLoading;
+}
+/** 수식을 그린다. 반환: 그렸으면 true (불러오지 못하면 LaTeX 글자 그대로 두고 false) */
+function renderMath(node) {
+return loadKatex().then(() => {
+for (const m of node.querySelectorAll('.math')) {
+window.renderMathInElement(m, { delimiters: [{ left: '$$', right: '$$', display: true }, { left: '$', right: '$', display: false }], throwOnError: false, strict: false });
+}
+return true;
+}).catch(() => false);
+}
+async function copyText(text, btn) {
+const label = btn.textContent;
+try { await navigator.clipboard.writeText(text); btn.textContent = '복사했습니다'; }
+catch { btn.textContent = '복사하지 못했습니다. 위 글을 직접 선택해 복사하세요'; }
+setTimeout(() => { btn.textContent = label; }, 2500);
+}
+/** AI가 옮겨 적은 문제(지문·문제·선지, LaTeX)를 보여 주는 접힌 칸. 펼칠 때 만들고 수식을 그린다 */
+function aiExtractView(it) {
+const ex = it.kind === 'problem' ? it.aiExtract : null;
+if (!ex?.problems?.length) return null;
+const main = ex.problems[ex.primary] || ex.problems[0];
+const body = el('div', { class: 'ai-extract' });
+const box = el('details', { class: 'ai-box' },
+el('summary', {}, 'AI가 옮겨 적은 문제 (LaTeX)', main.difficulty_level != null ? ` · 난이도 ${main.difficulty_level}단계 → ${levelToGrade(main.difficulty_level)}등급` : ''), body);
+let drawn = false, rendered = false, rendering = false;
+// 수식은 펼칠 때마다 아직 못 그렸으면 다시 그려 본다 (처음 펼쳤을 때 인터넷이 끊겼던 경우)
+const draw = () => {
+if (rendered || rendering) return;
+rendering = true;
+renderMath(body).then((ok) => { rendered = ok; rendering = false; });
+};
+box.addEventListener('toggle', () => {
+if (!box.open) return;
+if (drawn) { draw(); return; }
+drawn = true;
+const many = ex.problems.length > 1;
+ex.problems.forEach((p, i) => body.append(el('div', { class: 'ai-problem' + (many && i === ex.primary ? ' primary' : '') },
+el('div', { class: 'hint' }, [p.problem_number ? `번호 ${p.problem_number}` : '번호 없음', p.topic, p.has_figure_or_diagram ? '그림·도표 있음' : null,
+p.difficulty_level != null ? `난이도 ${p.difficulty_level}단계` : '난이도 없음', many && i === ex.primary ? '이 항목' : null].filter(Boolean).join(' · ')),
+p.passage ? el('div', { class: 'ai-passage math' }, p.passage) : null,
+el('div', { class: 'ai-question math' }, p.question || '(문제 글 없음)'),
+p.choices.length ? el('ul', { class: 'ai-choices math' }, ...p.choices.map((c) => el('li', {}, c))) : null,
+p.difficulty_reasoning ? el('div', { class: 'hint' }, `난이도 근거: ${p.difficulty_reasoning}`) : null)));
+const json = JSON.stringify(toSchemaJson(ex.problems), null, 2);
+body.append(...[ // (DOM append는 null을 "null" 글자로 넣으므로 빈 칸은 뺀다)
+el('details', {}, el('summary', {}, 'JSON 보기'), el('pre', { class: 'ai-json' }, json)),
+el('div', { class: 'row' }, el('button', { onclick: (ev) => copyText(json, ev.currentTarget) }, 'JSON 복사'),
+el('span', { class: 'hint' }, [PROVIDERS[ex.provider]?.label.replace(/\s*\(.*\)$/, '') || ex.provider, ex.model, String(ex.at || '').slice(0, 10)].filter(Boolean).join(' · '))),
+ex.stale ? el('p', { class: 'badge warn' }, '영역을 고친 뒤라 지금 영역과 다를 수 있습니다. 다시 판정하세요.') : null,
+].filter(Boolean));
+draw();
+});
+return box;
 }
 $('#rv-book').addEventListener('change', () => { rv.page = 1; loadReview(); });
 $('#rv-kind').addEventListener('change', () => { rv.page = 1; loadReview(); });
@@ -881,26 +1001,63 @@ for (const s of LLM_BUTTONS) $(s).disabled = false;
 renderLibrary();
 }
 }
+/** AI 판정 결과 한 줄 (로그용): 난이도·단원·유형·문제 글 앞부분, 자르기·번호 확인이 필요하면 ⚠ */
+function analysisLine(p, r) {
+const main = r.problems[r.primary];
+const q = String(main.question || '').replace(/\s+/g, ' ');
+const warn = [];
+if (r.problems.length > 1) warn.push(`이 영역에서 문제 ${r.problems.length}개를 읽음 — 자르기를 확인하세요`);
+if (hasUnreadable(main)) warn.push('안 보이는 부분 [미상] — 영역이 잘리지 않았는지 확인하세요');
+const n = numberOf(main.problem_number);
+if (n != null && n !== p.number) warn.push(`AI가 읽은 번호 ${main.problem_number}`);
+return `${itemKey(p)}번 → ${r.level != null ? `난이도 ${r.level}단계(${r.grade}등급)` : '난이도를 받지 못함(다음 "아직 안 한 문제만"에서 다시 판정)'} · ${r.topic || '단원 미상'} · 유형 ${r.type ?? UNCLASSIFIED}`
++ ` · ${main.choices.length ? `선지 ${main.choices.length}개` : '선지 없음'} · 문제: ${q.length > 60 ? q.slice(0, 60) + '…' : q || '(없음)'}${warn.length ? ` ⚠ ${warn.join(' · ')}` : ''}`;
+}
+/** 아직 AI 판정이 끝나지 않은 문제: 글을 옮겨 적지 않았거나(예전 방식으로 등급만 받은 문제 포함), 영역을 고쳐 다시 판정이 필요하거나, 난이도를 받지 못한 문제 */
+const needsAnalysis = (i) => !i.aiExtract || !!i.aiExtract.stale || i.difficultyLLM == null;
 async function runLLMLoop(c, book, all, limit) {
 const items = await db.byBook('items', book.id);
-const sols = new Map(items.filter((i) => i.kind === 'solution').map((s) => [s.id, s]));
-let todo = items.filter((i) => i.kind === 'problem' && i.image && (all || i.gradeLLM == null));
+let todo = items.filter((i) => i.kind === 'problem' && i.image && (all || needsAnalysis(i)));
 todo.sort(byItemOrder);
 if (limit) todo = todo.slice(0, limit);
+// 요청 수·사용량이 크게 늘 수 있는 경우는 시작 전에 묻는다
+if (!limit && todo.length > 1) {
+const legacy = todo.filter((i) => !i.aiExtract && i.gradeLLM != null);
+if (all) {
+if (!confirm(`이 책의 문제 ${todo.length}개를 모두 다시 AI로 판정합니다. 문제마다 요청을 하나씩 보내므로 시간과 사용량이 듭니다. 계속할까요?`)) { grLog('AI 판정을 시작하지 않았습니다.'); return; }
+} else if (legacy.length && !confirm(`예전 방식으로 AI 등급만 받은 문제가 ${legacy.length}개 있습니다. 이 문제들도 다시 판정해 문제 글·수식을 옮겨 적을까요?\n`
++ '다시 판정하면 등급이 새 결과로 바뀌고 요청 수·사용량이 그만큼 늘어납니다.\n(취소를 누르면 그 문제들은 건너뛰고 나머지만 판정합니다)')) {
+todo = todo.filter((i) => !legacy.includes(i));
+}
+}
 stopFlag = false;
 let ok = 0, fail = 0;
+if (!todo.length) grLog('새로 판정할 문제가 없습니다. 모든 문제를 다시 판정하려면 "AI 판정 (전체 다시)"를 누르세요.', 1);
+if (todo.length > 1) grLog(`AI 판정할 문제 ${todo.length}개 (문제마다 글·수식을 옮겨 적으므로 1문제에 몇 초~수십 초 걸립니다)`, 0);
 for (let i = 0; i < todo.length && !stopFlag; i++) {
-const p = todo[i];
+// 보내기 직전에 최신 기록을 읽는다: 그사이 영역을 고쳤으면 새 자르기를, 지웠거나 다른 창에서 판정을 마쳤으면 건너뛴다
+const p = await db.get('items', todo[i].id);
+if (!p || !p.image || (!all && !limit && !needsAnalysis(p))) continue;
 try {
-const r = await gradeWithLLM(c, p, sols.get(p.solutionId), book.subject);
-// 실행 중에 직접 지정한 유형·등급을 덮어쓰지 않도록 저장 직전의 기록에 AI 결과만 반영한다
+const r = await analyzeWithLLM(c, p, book.subject);
+// 실행 중에 직접 지정한 유형·등급을 덮어쓰지 않도록 저장 직전의 기록에 AI 결과만 반영한다.
+// 그사이 영역을 고쳐 자르기가 바뀌었으면 이 결과(옛 영역의 글)는 저장하지 않는다.
+let recut = false;
 const saved = await db.update('items', p.id, (fresh) => {
-fresh.gradeLLM = r.grade; fresh.unit = r.unit; fresh.subjectLLM = r.subject; fresh.llmReason = r.reason; fresh.typeLLM = r.type ?? null;
-if (!fresh.answer && r.answer) { fresh.answer = r.answer; fresh.answerLLM = true; }
+if ((fresh.imageId ?? null) !== (p.imageId ?? null)) { recut = true; return db.SKIP; }
+fresh.aiExtract = { problems: r.problems, primary: r.primary, provider: c.provider, model: c.model, at: new Date().toISOString() };
+// 난이도·근거·등급은 이 글과 한 묶음: 난이도를 받지 못했으면 옛 값도 지운다 (다음 "아직 안 한 문제만"에서 다시 판정)
+fresh.difficultyLLM = r.level ?? null; fresh.gradeLLM = r.grade ?? null; fresh.llmReason = r.level != null ? r.reason : null;
+fresh.unit = r.topic; fresh.typeLLM = r.type ?? null;
+if (r.subject) fresh.subjectLLM = r.subject; // 단원 글에 과목이 없으면 전에 알던 과목을 둔다
 });
-if (!saved) { fail++; grLog(`${itemKey(p)}번: 그사이 문제가 지워지거나 다시 분리되어 결과를 저장하지 못했습니다.`, (i + 1) / todo.length); continue; }
+if (!saved) {
+fail++;
+grLog(`${itemKey(p)}번: ${recut ? '판정하는 사이 영역을 고쳐 이 결과는 저장하지 않았습니다. 다시 판정하세요.' : '그사이 문제가 지워지거나 다시 분리되어 결과를 저장하지 못했습니다.'}`, (i + 1) / todo.length);
+continue;
+}
 ok++;
-grLog(`${itemKey(p)}번 → ${r.grade}등급 · ${r.subject ?? ''} ${r.unit ?? ''} · 유형 ${r.type ?? UNCLASSIFIED} · ${r.reason}`, (i + 1) / todo.length);
+grLog(analysisLine(p, r), (i + 1) / todo.length);
 } catch (e) {
 fail++;
 grLog(`${itemKey(p)}번 실패: ${e.message}`, (i + 1) / todo.length);
@@ -916,6 +1073,49 @@ if ($('#tab-classify').classList.contains('active')) renderClassify();
 $('#gr-test').addEventListener('click', () => runLLM(true, 1));
 $('#gr-llm').addEventListener('click', () => runLLM(false));
 $('#gr-llm-all').addEventListener('click', () => runLLM(true));
+// AI가 옮겨 적은 문제를 지정된 JSON 구조 {"problems": [...]}로 내려받는다 (책 안 순서, 한 영역에서 여러 문제를 읽었으면 모두)
+$('#gr-export').addEventListener('click', async () => {
+const book = bookById($('#gr-book').value);
+if (!book) return alert('먼저 책을 추가하세요.');
+const done = (await db.byBook('items', book.id)).filter((i) => i.kind === 'problem' && i.aiExtract?.problems?.length).sort(byItemOrder);
+if (!done.length) return alert('이 책에는 아직 AI 판정으로 옮겨 적은 문제가 없습니다. 먼저 AI 판정을 실행하세요.');
+// 영역마다 그 항목의 문제를 넣는다. 한 영역에서 더 읽은 문제는 모두 넣되, 그 영역이 다른 영역과 실제로 겹치고(같은 쪽의 같은 자리)
+// 그 영역에서 AI가 같은 번호(라벨 포함)로 읽은 문제가 있으면 같은 인쇄 문제를 두 번 읽은 것이므로 한 번만 넣는다.
+// (번호·첫머리 글만 같은 다른 단원·다른 라벨의 문제는 지우지 않는다.) 각 문제가 어느 항목·쪽에서 왔는지는 "sources"에 같은 순서로 적는다.
+const picked = [], sources = [], extraNames = [], droppedNames = [];
+const pagesOf = (it) => [...new Set(it.fragments.map((f) => f.page))];
+const boxesOverlap = (a, b) => a.page === b.page && Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0) > 0.5 * Math.min(a.x1 - a.x0, b.x1 - b.x0) && Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0) > 8;
+const cropsOverlap = (a, b) => a.fragments.some((f) => b.fragments.some((g) => boxesOverlap(f, g)));
+const aiKey = (p) => { const n = numberOf(p.problem_number); return n == null ? null : `${String(p.problem_number).normalize('NFKC').replace(/[^가-힣A-Za-z]/g, '')}|${n}`; };
+const flat = (p) => String(p.question || '').replace(/\s+/g, '');
+const mainOf = (it) => it.aiExtract.problems[it.aiExtract.primary] || it.aiExtract.problems[0];
+const kept = done.map((it) => ({ it, p: mainOf(it) })); // 모든 영역의 주 문제 (중복 확인용)
+const source = (it, extra) => ({ book: book.name, item: itemKey(it), pages: pagesOf(it), ...(extra ? { extra: true } : {}), ...(it.aiExtract.stale ? { stale: true } : {}) });
+for (const it of done) {
+const main = mainOf(it);
+picked.push(main); sources.push(source(it, false));
+for (const p of it.aiExtract.problems) {
+if (p === main) continue;
+const k = aiKey(p), name = `${itemKey(it)}의 ${p.problem_number || '번호 없는 문제'}`;
+const dup = kept.some((o) => o.it !== it && cropsOverlap(o.it, it) && (k != null ? aiKey(o.p) === k : flat(o.p) === flat(p)));
+if (dup) { droppedNames.push(name); continue; }
+picked.push(p); sources.push(source(it, true)); kept.push({ it, p }); extraNames.push(name);
+}
+}
+const data = { ...toSchemaJson(picked), sources };
+const listed = (names) => `${names.slice(0, 5).join(', ')}${names.length > 5 ? ` 외 ${names.length - 5}개` : ''}`;
+const a = el('a', {
+href: URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })),
+download: `${book.name.replace(/[\\/:*?"<>|]+/g, '_').slice(0, 80)}_AI판정.json`,
+});
+document.body.append(a); a.click(); a.remove();
+setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+const stale = done.filter((i) => i.aiExtract.stale).length;
+const left = (await db.byBook('items', book.id)).filter((i) => i.kind === 'problem' && !i.aiExtract).length;
+grLog(`JSON 내려받기: 문제 ${data.problems.length}개 (${done.length}개 영역${extraNames.length ? `, 한 영역에서 더 읽은 문제 ${extraNames.length}개 포함: ${listed(extraNames)} — 자르기를 확인하세요` : ''})`
++ (droppedNames.length ? ` · 겹친 영역에서 두 번 읽힌 문제 ${droppedNames.length}개는 한 번만 넣음: ${listed(droppedNames)}` : '')
++ (stale ? ` · 영역을 고친 뒤 다시 판정하지 않은 ${stale}개 포함` : '') + (left ? ` · 아직 AI 판정 안 한 문제 ${left}개는 빠짐` : ''));
+});
 $('#gr-book').addEventListener('change', renderHist);
 async function renderHist() {
 const id = $('#gr-book').value;
@@ -1304,6 +1504,8 @@ return image ? { ...it, image, imageBytes: image.size, imageId: db.uid('i') } : 
 const isStoreName = (s) => Object.prototype.hasOwnProperty.call(cleanRecord, s);
 // 이미지와 한 묶음인 값: 쪽은 이미지 자체, 문제·해설은 그 이미지가 보여 주는 영역과 글자까지
 const IMAGE_FIELDS = ['image', 'imageId', 'imageFormat', 'imageBytes'];
+// AI 판정 한 번이 함께 만든 값 (나눠 섞으면 글과 등급이 서로 맞지 않게 된다)
+const AI_FIELDS = ['aiExtract', 'gradeLLM', 'difficultyLLM', 'llmReason', 'unit', 'subjectLLM', 'typeLLM'];
 const CROP_FIELDS_BY_STORE = { pages: ['width', 'height'], items: ['fragments', 'w', 'h', 'text', 'pageHeight', 'scale'] };
 /**
 * 백업에 이미지가 없는 기록(내보낼 때 폴더 권한이 없었거나 파일을 못 읽음)이 라이브러리의 같은 기록을 덮어쓸 때는
@@ -1314,6 +1516,12 @@ if (v.image != null || old?.image == null) return v;
 const kept = { ...v };
 delete kept.imageMissing;
 for (const k of [...IMAGE_FIELDS, ...(CROP_FIELDS_BY_STORE[s] || [])]) { if (k in old) kept[k] = old[k]; else delete kept[k]; }
+// AI가 옮겨 적은 글과 그 난이도·유형은 그 자르기의 것이다 (한 묶음으로 옮긴다):
+// 라이브러리에 있으면 라이브러리 것을 모두, 없으면 백업 것을 모두 쓰되 영역이 다르면 '다시 판정 필요'로
+if (s === 'items') {
+if (old.aiExtract) for (const k of AI_FIELDS) { if (k in old) kept[k] = old[k]; else delete kept[k]; }
+else if (v.aiExtract && !sameRegions(v.fragments, old.fragments)) kept.aiExtract = { ...v.aiExtract, stale: true };
+}
 return kept;
 }
 /**

@@ -1971,6 +1971,7 @@ const ALIASES = {
 '지수함수': '지수함수와 로그함수', '로그함수': '지수함수와 로그함수', '극한': '함수의 극한과 연속',
 '방정식': '방정식과 부등식', '부등식': '방정식과 부등식', '도형': '도형의 방정식', '집합': '집합과 명제', '명제': '집합과 명제',
 '여러가지미분법': '여러 가지 함수의 미분', '여러가지적분법': '여러 가지 함수의 적분',
+'연속': '함수의 극한과 연속', '함수의연속': '함수의 극한과 연속', '함수의극한': '함수의 극한과 연속',
 };
 const NO_TYPE = new Set(['미분류', '기타', '없음', '모름', 'null', 'none', 'unknown', 'n/a']);
 // 단원 이름이 과목 밖 유형으로 풀렸을 때 그 과목 안의 유형으로 옮긴다 (예: 미적분의 "삼각함수의 극한" → 여러 가지 함수의 미분)
@@ -2066,6 +2067,14 @@ return true;
 * pool: 문제 목록, opts: {target(1~9), count, mix, seed, requireSolution, bookIds, subjects, excludeTypes}
 * 쉬운 문제 → 어려운 문제 순으로 정렬해서 반환
 */
+/**
+* 목표 등급까지의 거리. AI의 5단계 난이도에서 바꾼 등급(1·3·5·7·9)은 두 등급에 걸친 폭이므로 ±1 안은 목표와 같게 본다
+* (4단계 → 3등급은 목표 2·3·4등급 모두에 맞는다). 직접 지정·규칙·예전 AI 등급은 그 등급 그대로.
+*/
+function gradeDistance(p, target) {
+const band = p.gradeManual == null && p.gradeLLM != null && p.difficultyLLM != null ? 1 : 0;
+return Math.max(0, Math.abs(effectiveGrade(p) - target) - band);
+}
 function selectProblems(pool, opts) {
 const target = opts.target;
 const count = opts.count;
@@ -2073,10 +2082,11 @@ const mix = opts.mix || MIX_PRESETS.balanced;
 const rand = rng(opts.seed ?? Date.now());
 const cand = shuffle(filterPool(pool, opts), rand);
 const g = (p) => effectiveGrade(p);
+const d = (p) => gradeDistance(p, target);
 const buckets = {
-harder: cand.filter((p) => g(p) < target && g(p) >= target - 2),
-target: cand.filter((p) => g(p) === target),
-easier: cand.filter((p) => g(p) > target && g(p) <= target + 2),
+harder: cand.filter((p) => g(p) < target && d(p) > 0 && d(p) <= 2),
+target: cand.filter((p) => d(p) === 0),
+easier: cand.filter((p) => g(p) > target && d(p) > 0 && d(p) <= 2),
 };
 const quota = {
 harder: target === 1 ? 0 : Math.round(count * mix.harder),
@@ -2094,7 +2104,7 @@ return n;
 let short = 0;
 for (const k of ['target', 'harder', 'easier']) short += take(buckets[k], quota[k]);
 if (short > 0) {
-const rest = cand.filter((p) => !chosen.has(p)).sort((a, b) => Math.abs(g(a) - target) - Math.abs(g(b) - target));
+const rest = cand.filter((p) => !chosen.has(p)).sort((a, b) => d(a) - d(b));
 short = take(rest, short);
 }
 const result = [...chosen];
@@ -2107,13 +2117,13 @@ const cur = selected[index];
 const used = new Set(selected.map((p) => p.id));
 const target = effectiveGrade(cur);
 const cand = shuffle(filterPool(pool, opts).filter((p) => !used.has(p.id)), rng(seed));
-cand.sort((a, b) => Math.abs(effectiveGrade(a) - target) - Math.abs(effectiveGrade(b) - target));
+cand.sort((a, b) => gradeDistance(a, target) - gradeDistance(b, target));
 if (!cand.length) return selected;
 const out = selected.slice();
 out[index] = cand[0];
 return out;
 }
-return { rng, MIX_PRESETS, filterPool, selectProblems, replaceOne };
+return { rng, MIX_PRESETS, filterPool, gradeDistance, selectProblems, replaceOne };
 })();
 M.imaging = (() => {
 const db = M.db;

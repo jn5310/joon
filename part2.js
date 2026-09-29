@@ -246,7 +246,7 @@ return { ocrCanvas, ocrNumberStrips, mergeLines, normalizeOcrData, terminateOcr 
 })();
 M.llm = (() => {
 const { loadImage } = M.imaging;
-const { TYPE_LABELS, normalizeType } = M.classify;
+const { normalizeType } = M.classify;
 const PROVIDERS = {
 gemini:    { label: 'Google Gemini (무료 등급 있음)', model: 'gemini-2.5-flash', needsKey: true },
 anthropic: { label: 'Anthropic Claude', model: 'claude-sonnet-4-5', needsKey: true },
@@ -254,24 +254,67 @@ openai:    { label: 'OpenAI', model: 'gpt-4o-mini', needsKey: true },
 ollama:    { label: 'Ollama (내 PC, 키 불필요)', model: 'qwen2.5vl:7b', needsKey: false },
 };
 const SUBJECTS = ['수학(상)', '수학(하)', '공통수학1', '공통수학2', '수학I', '수학II', '대수', '미적분I', '미적분', '미적분II', '확률과 통계', '기하'];
-function buildPrompt(subjectHint, hasSolution) {
-return `당신은 한국 고등학교 수학 문제의 난이도를 평가하는 전문가입니다.
-첫 번째 이미지는 문제${hasSolution ? ', 두 번째 이미지는 그 문제의 해설' : ''}입니다.
-${subjectHint ? `참고: 이 책의 과목은 "${subjectHint}"입니다.
-` : ''}
-이 문제가 "수능 몇 등급 학생에게 알맞은 문제인지"를 1~9 정수로 판정하세요.
-(그 등급대 학생의 정답률이 대략 50% 정도인 수준)
-- 1: 킬러·준킬러 (전체 정답률 20% 미만)
-- 2: 고난도 4점
-- 3: 일반적인 4점 중상
-- 4: 쉬운 4점 / 어려운 3점
-- 5: 보통 3점
-- 6: 쉬운 3점
-- 7: 2점 수준의 계산 문제
-- 8~9: 개념 확인, 공식 대입, 기초 계산
-유형(type)은 다음 목록에서 가장 알맞은 하나를 글자 그대로 고르세요: ${TYPE_LABELS.join(', ')}
-반드시 아래 JSON 형식으로만 답하세요:
-{"grade": 정수, "subject": "과목(${SUBJECTS.join('/')} 중 하나)", "unit": "단원명", "type": "유형(위 목록 중 하나)", "answer": "정답(알 수 있으면, 없으면 null)", "reason": "한 문장 근거"}`;
+/**
+* AI 판정(비전 OCR)의 시스템 프롬프트 — 사용자가 정한 문구 그대로 둔다.
+* 수식은 LaTeX($ … $, $$ … $$)로 옮기고, 지문·문제·선지·번호를 나누고, 1~5단계 난이도와 단원·유형을 JSON으로 받는다.
+*/
+const OCR_SYSTEM_PROMPT = `너는 20년 경력의 수학 시험지 정보화 및 OCR 전문가이자 수학 교육과정 평가 전문가다.
+
+너의 역할은 제공된 수학 문제 이미지를 고정밀 비전(Vision) 기술로 분석하여, 수식과 문제 구조를 완벽히 추출하고 지정된 JSON 포맷으로 변환하는 것이다.
+
+### 핵심 지시사항:
+1. **수학 기호 및 수식 포맷팅 (LaTeX 사용)**:
+   - 모든 수학 기호, 수식, 변수, 연산자는 표준 LaTeX 구문으로 변환할 것.
+   - 문장 내에 포함된 단일 수식은 \`$ ... $\` 구분을 사용할 것 (예: $x^2 + y^2 = 1$).
+   - 독립된 줄로 표시되는 복잡한 다항식, 분수식, 수식 단계는 \`$$ ... $$\` 구분을 사용할 것.
+   - 분수(\`\\frac{a}{b}\`), 루트(\`\\sqrt{n}\`), 극한(\`\\lim_{x \\to \\infty}\`), 행렬, 적분, 기하 기호를 정확히 파악할 것.
+
+2. **문제 구조 분리**:
+   - 여러 문제에 공통으로 적용되는 지문/보기(\`passage\`)가 있다면 일반 문제(\`question\`)와 명확히 분리할 것.
+   - 객관식 선지(①, ②, ③, ④, ⑤)를 인식하여 수식 포맷을 유지한 채 배열(\`choices\`) 형식으로 추출할 것.
+   - 문제 번호(예: "01.", "12번")를 정확히 추출할 것.
+
+3. **난이도 및 유형 자동 분류 엔진 (1~5단계)**:
+   - 문제의 난이도를 1단계(매우 쉬움 / 단순 계산)부터 5단계(고난도 / 킬러 문항)까지 자체 평가하여 지정할 것.
+   - 수학 단원 및 유형(예: "수학 II - 미분계수와 도함수", "다항식의 연산")을 추론하여 명시할 것.
+
+4. **엄격한 JSON 출력 포맷**:
+   - 오직 아래 명시된 JSON 구조로만 응답할 것. JSON 코드 블록 외에 다른 서론이나 결론 텍스트를 포함하지 말 것.
+
+\`\`\`json
+{
+  "problems": [
+    {
+      "problem_number": "01",
+      "passage": "공통 지문이 있는 경우 여기에 작성, 없으면 null",
+      "question": "함수 $f(x) = x^2 + 3x$에 대하여 $f'(2)$의 값을 구하시오.",
+      "choices": [
+        "① $5$",
+        "② $7$",
+        "③ $9$",
+        "④ $11$",
+        "⑤ $13$"
+      ],
+      "has_figure_or_diagram": false,
+      "topic": "미분 - 도함수",
+      "difficulty_level": 2,
+      "difficulty_reasoning": "다항함수의 기본 미분 공식을 적용하여 지점에서의 함숫값을 구하는 단순 유형임."
+    }
+  ]
+}
+\`\`\`
+
+잘려서 안 보이거나 흐릿한 부분은 임의로 지어내지 말고 \\text{[미상]}으로 표기할 것.
+
+한국어 오탈자 없이 원문 그대로 정확하게 추출할 것.`;
+/** 응답 JSON에서 문제 하나가 가지는 항목 (내보낼 때도 이 순서) */
+const PROBLEM_KEYS = ['problem_number', 'passage', 'question', 'choices', 'has_figure_or_diagram', 'topic', 'difficulty_level', 'difficulty_reasoning'];
+/** 사용자 메시지: 이미지가 무엇인지와 참고할 과목만 알린다 (형식·규칙은 모두 시스템 프롬프트에 있다) */
+function buildUserText(subjectHint) {
+return '첨부한 이미지는 수학 문제집에서 잘라 낸 문제 영역입니다. 지시사항에 따라 분석하고 지정된 JSON 구조로만 답하세요.'
++ (subjectHint ? `\n참고: 이 책의 과목은 "${subjectHint}"입니다.`
+// 과목을 모르는 책: 지시사항의 첫 예시처럼 topic 앞에 과목을 붙여 달라고 한다 (시험지 과목 필터에 쓴다)
+: '\n과목을 알 수 있으면 topic 앞에 "수학 II - 미분계수와 도함수"처럼 과목을 붙여 주세요.');
 }
 /** LLM에는 원본 포맷을 유지하고, 필요할 때만 고품질 무손실로 축소한다. */
 async function shrink(source, maxW = 1600) {
@@ -290,98 +333,326 @@ ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
 ctx.drawImage(im, 0, 0, c.width, c.height);
 return { data: c.toDataURL('image/png').split(',')[1], mime: 'image/png' };
 }
-function parseJsonLoose(text) {
-const m = text.match(/\{[\s\S]*\}/);
-if (!m) throw new Error('JSON 응답 없음: ' + text.slice(0, 200));
-const o = JSON.parse(m[0]);
-const g = Math.round(Number(o.grade));
-if (!(g >= 1 && g <= 9)) throw new Error('grade 범위 오류: ' + o.grade);
-return {
-grade: g, subject: o.subject || null, unit: o.unit || null, type: o.type == null || o.type === 'null' ? null : String(o.type),
-answer: o.answer == null || o.answer === 'null' ? null : String(o.answer), reason: o.reason || '',
-};
-}
-async function call(cfg, prompt, images) {
+/** 제공자별 요청. 시스템 프롬프트는 각 API의 시스템 자리(system · system 메시지 · systemInstruction)에 넣는다 */
+function buildRequest(cfg, system, userText, images) {
 const { provider, apiKey, model } = cfg;
-let res, text;
+const post = (body, headers = {}) => ({ method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
 if (provider === 'anthropic') {
-res = await fetch('https://api.anthropic.com/v1/messages', {
-method: 'POST',
-headers: {
-'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01',
-'anthropic-dangerous-direct-browser-access': 'true',
-},
-body: JSON.stringify({
-model, max_tokens: 400,
+return {
+url: 'https://api.anthropic.com/v1/messages',
+init: post({
+model, max_tokens: 4096, temperature: 0, system, // 문제 글과 수식을 모두 옮겨 적으므로 넉넉하게, 원문 그대로 옮기도록 무작위성 없이
 messages: [{ role: 'user', content: [
 ...images.map((d) => ({ type: 'image', source: { type: 'base64', media_type: d.mime, data: d.data } })),
-{ type: 'text', text: prompt },
+{ type: 'text', text: userText },
 ] }],
-}),
-});
-if (!res.ok) throw httpError(res, await res.text());
-text = (await res.json()).content.map((c) => c.text || '').join('');
-} else if (provider === 'openai') {
-res = await fetch('https://api.openai.com/v1/chat/completions', {
-method: 'POST',
-headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
-body: JSON.stringify({
-model, response_format: { type: 'json_object' },
-messages: [{ role: 'user', content: [
-{ type: 'text', text: prompt },
+}, { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' }),
+};
+}
+if (provider === 'openai') {
+return {
+url: 'https://api.openai.com/v1/chat/completions',
+init: post({
+// temperature는 GPT-4 계열에만 보낸다 (o 시리즈·GPT-5 같은 추론 모델은 기본값 외의 temperature를 거부한다)
+model, response_format: { type: 'json_object' }, ...(/^gpt-4/i.test(model) ? { temperature: 0 } : {}),
+messages: [
+{ role: 'system', content: system },
+{ role: 'user', content: [
 ...images.map((d) => ({ type: 'image_url', image_url: { url: `data:${d.mime};base64,${d.data}` } })),
-] }],
-}),
-});
-if (!res.ok) throw httpError(res, await res.text());
-text = (await res.json()).choices[0].message.content;
-} else if (provider === 'gemini') {
-res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
-method: 'POST',
-headers: { 'content-type': 'application/json' },
-body: JSON.stringify({
-contents: [{ parts: [{ text: prompt }, ...images.map((d) => ({ inline_data: { mime_type: d.mime, data: d.data } }))] }],
+{ type: 'text', text: userText },
+] },
+],
+}, { authorization: `Bearer ${apiKey}` }),
+};
+}
+if (provider === 'gemini') {
+return {
+url: `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+init: post({
+systemInstruction: { parts: [{ text: system }] },
+contents: [{ role: 'user', parts: [...images.map((d) => ({ inline_data: { mime_type: d.mime, data: d.data } })), { text: userText }] }],
 generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
 }),
-});
-if (!res.ok) throw httpError(res, await res.text());
-const j = await res.json();
-text = (j.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('');
-} else if (provider === 'ollama') {
+};
+}
+if (provider === 'ollama') {
 const base = (cfg.baseUrl || 'http://localhost:11434').replace(/\/$/, '');
-res = await fetch(`${base}/api/chat`, {
-method: 'POST',
-headers: { 'content-type': 'application/json' },
-body: JSON.stringify({ model, stream: false, format: 'json', messages: [{ role: 'user', content: prompt, images: images.map((d) => d.data) }] }),
-});
-if (!res.ok) throw httpError(res, await res.text());
-text = (await res.json()).message.content;
-} else {
+return {
+url: `${base}/api/chat`,
+init: post({ model, stream: false, format: 'json', options: { temperature: 0 }, messages: [{ role: 'system', content: system }, { role: 'user', content: userText, images: images.map((d) => d.data) }] }),
+};
+}
 throw new Error('알 수 없는 제공자: ' + provider);
 }
-return parseJsonLoose(text);
+/** 제공자별 응답에서 모델이 쓴 글만 꺼낸다 */
+function responseText(provider, j) {
+if (provider === 'anthropic') return (j?.content || []).map((c) => c.text || '').join('');
+if (provider === 'openai') return j?.choices?.[0]?.message?.content || '';
+if (provider === 'gemini') return (j?.candidates?.[0]?.content?.parts || []).filter((p) => !p.thought).map((p) => p.text || '').join('');
+return j?.message?.content || '';
+}
+/** 정상 종료가 아니면 그 이유 (응답이 잘렸거나 막힌 경우를 알리기 위해). 정상이면 '' */
+function stopNote(provider, j) {
+const r = provider === 'gemini' ? (j?.promptFeedback?.blockReason || j?.candidates?.[0]?.finishReason)
+: provider === 'anthropic' ? j?.stop_reason
+: provider === 'openai' ? (j?.choices?.[0]?.message?.refusal ? 'refusal' : j?.choices?.[0]?.finish_reason)
+: j?.done_reason;
+if (!r || ['STOP', 'end_turn', 'stop', 'stop_sequence'].includes(r)) return '';
+if (r === 'RECITATION') return 'RECITATION: 교재 원문을 그대로 옮기는 응답을 Gemini가 막았습니다. 다시 시도하거나 다른 제공자를 쓰세요';
+if (['MAX_TOKENS', 'max_tokens', 'length'].includes(r)) return `${r}: 응답이 너무 길어 잘렸습니다. 영역에 문제가 여러 개 들어 있지 않은지 확인하세요`;
+return String(r);
+}
+const TRUNCATED = /^(?:MAX_TOKENS|max_tokens|length):/;
+/** 응답은 왔지만 쓸 수 없는 경우 (한 번 더 시도해 볼 만하다) */
+function badResponse(message) { const e = new Error(message); e.badResponse = true; return e; }
+/** 글에서 첫 JSON 객체만 꺼낸다 (```json 코드 블록이나 앞뒤 설명이 붙어도). 문자열 안의 괄호는 세지 않는다 */
+function extractJsonObject(text) {
+const s = String(text ?? '');
+const start = s.indexOf('{');
+if (start < 0) return null;
+let depth = 0, inStr = false;
+for (let i = start; i < s.length; i++) {
+const ch = s[i];
+if (inStr) { if (ch === '\\') i++; else if (ch === '"') inStr = false; continue; }
+if (ch === '"') inStr = true;
+else if (ch === '{') depth++;
+else if (ch === '}' && --depth === 0) return s.slice(start, i + 1);
+}
+return s.slice(start); // 끝이 잘린 응답: 그대로 읽어 보고 오류를 알린다
+}
+// 모델이 JSON 이스케이프를 잊고 LaTeX 역슬래시를 하나만 쓰면, \frac \beta \text \right \neq 같은 명령이 JSON에서는
+// 폼피드·백스페이스·탭·CR·줄바꿈으로 읽혀 수식이 조용히 깨진다. 문자열마다 따로 판단해 고친다 (올바르게 쓴 문자열은 건드리지 않는다).
+// \n 뒤에 오면 LaTeX 명령일 수 있는 이름: 진짜 줄바꿈 뒤에도 올 수 있어(e^{x}, i^{2}) 수식 안에서만 명령으로 본다
+const LATEX_N = /^n(?:eq|e|eg|abla|otin|ot|i|u|leq|geq|less|gtr|mid|parallel|subseteq|supseteq|subset|supset|exists|olimits)(?![A-Za-z])/;
+/** 문자열 하나(따옴표 안, 이스케이프 전)를 고친다 */
+function repairLiteral(raw) {
+// 이 문자열에 역슬래시를 하나만 쓴 흔적(JSON에 없는 이스케이프, 글자 앞의 \b \f \r \t)이 있는지
+let single = false;
+for (let i = 0; i < raw.length && !single; i++) {
+if (raw[i] !== '\\') continue;
+const nx = raw[i + 1] ?? '';
+if (nx === '\\' || nx === '"' || nx === '/' || nx === 'n') { i++; continue; }
+if (nx === 'u' && /^[0-9a-fA-F]{4}$/.test(raw.slice(i + 2, i + 6))) { i += 5; continue; }
+if ('bfrt'.includes(nx) && nx && !/[A-Za-z]/.test(raw[i + 2] ?? '')) { i++; continue; }
+single = true;
+}
+let out = '', math = '', prev = '';
+for (let i = 0; i < raw.length; i++) {
+const ch = raw[i];
+// 문자열 안에 그대로 들어간 줄바꿈·탭 (JSON에서는 허용되지 않는다)
+if (ch === '\n' || ch === '\r' || ch === '\t') { out += ch === '\n' ? '\\n' : ch === '\r' ? '\\r' : '\\t'; prev = ch; continue; }
+if (ch === '$') {
+if (raw[i + 1] === '$' && math !== '$') { math = math === '$$' ? '' : '$$'; out += '$$'; i++; prev = '$'; continue; }
+if (math !== '$$') math = math === '$' ? '' : '$';
+out += ch; prev = ch; continue;
+}
+if (ch !== '\\') { out += ch; prev = ch; continue; }
+const nx = raw[i + 1] ?? '';
+if (nx === '\\' || nx === '"' || nx === '/') { out += ch + nx; i++; prev = nx; continue; }
+if (nx === 'u' && /^[0-9a-fA-F]{4}$/.test(raw.slice(i + 2, i + 6))) { out += raw.slice(i, i + 6); i += 5; prev = 'u'; continue; }
+if (nx === '$') { out += '\\\\$'; i++; prev = '$'; continue; } // LaTeX의 \$ (달러 기호 글자): 수식 구분자가 아니다
+let latex;
+if (nx === 'n') {
+const m = raw.slice(i + 1, i + 24).match(LATEX_N);
+const after = m ? raw[i + 1 + m[0].length] ?? '' : '';
+// 수식 안에서만 명령으로 본다. 행렬·연립의 줄바꿈 \\ 바로 뒤(다음 줄 시작)와, 뒤에 ^ _ 한글이 오는 경우(e^{x}, i^{2}, e는)는 진짜 줄바꿈.
+// $ … $ 안은 그 밖에는 명령. $$ … $$ 안에서 \neq \neg \nabla \not 처럼 두 글자 이상인 이름은 진짜 줄바꿈 뒤에 올 일이 없어 명령,
+// \ne \ni \nu처럼 한 글자는 e(x)·i·u(x)로 시작하는 새 줄일 수 있어, 역슬래시 하나짜리 문자열이고 앞에 띄어쓰기가 있을 때("a \ne b")만 명령
+if (!m || prev === '\\' || (m[0].length === 2 && /[\^_가-힣]/.test(after))) latex = false; // ^ _ 한글 확인은 \ne \ni \nu만 (\nolimits_ \nabla^는 명령)
+else if (math === '$') latex = true;
+else if (math === '$$') latex = m[0].length > 2 || (single && prev === ' ');
+else latex = false;
+} else if ('bfrt'.includes(nx) && nx) latex = /[A-Za-z]/.test(raw[i + 2] ?? '');
+else latex = true; // JSON에 없는 이스케이프(\s \l \{ \, \\ 앞 공백 …)는 LaTeX
+if (latex) { out += '\\\\'; prev = '\\'; continue; } // LaTeX의 역슬래시 하나 (다음 글자부터 그대로 이어 읽는다)
+out += ch + nx; i++; prev = nx === 'n' ? '\n' : nx;
+}
+return out;
+}
+/** JSON 글 전체에서 문자열마다 repairLiteral을 적용한다 */
+function repairJsonText(s) {
+let out = '';
+for (let i = 0; i < s.length; i++) {
+if (s[i] !== '"') { out += s[i]; continue; }
+let j = i + 1;
+for (; j < s.length && s[j] !== '"'; j++) if (s[j] === '\\') j++;
+out += '"' + repairLiteral(s.slice(i + 1, Math.min(j, s.length))) + (j < s.length ? '"' : '');
+i = j;
+}
+return out;
+}
+// 행렬·연립(cases) 안의 줄바꿈 \\ 가 역슬래시 하나로 줄어든 것을 되돌린다: " \ " → " \\ ", "2\3" "0)\-x" → "2\\3" "0)\\-x".
+// 환경 안에 제대로 쓴 \\ 가 하나라도 있으면 줄바꿈을 올바르게 쓴 것이므로 남은 "\ "는 LaTeX의 띄어쓰기로 두고, "\ \ "처럼 이어 쓴 띄어쓰기도 둔다
+const ROW_ENV = /\\begin\{(cases|rcases|dcases|[pbvBV]?matrix|smallmatrix|aligned|align\*?|array|gathered|split)\}([\s\S]*?)\\end\{\1\}/g;
+function fixRowBreaks(s) {
+return s.replace(ROW_ENV, (m, env, body) => {
+if (body.includes('\\\\')) return m;
+const fixed = body.replace(/\\(?=[\s\d-])/g, (bs, at) => {
+const before = body.slice(0, at), after = body.slice(at + 1);
+if (/\s/.test(after[0] ?? '')) {
+if (/\\(?:text|mathrm|textrm|mbox)\{[^{}]*\}$/.test(before)) return bs; // "\text{if}\ x" 같은 글 뒤 띄어쓰기 (x^{2}\ g(x)처럼 수식 뒤는 줄바꿈)
+if (/\\\s*$/.test(before) || /^\s*\\\s/.test(after)) return bs; // "\ \ " 두 칸 띄어쓰기
+if (body.includes('&') && !after.includes('&')) return bs; // & 로 칸을 나누는 환경의 마지막 줄 안: 줄바꿈이 아니라 띄어쓰기 (x^{2}\ (x > 0))
+}
+return '\\\\';
+});
+return `\\begin{${env}}${fixed}\\end{${env}}`;
+});
+}
+function mapStrings(v, fn) {
+if (typeof v === 'string') return fn(v);
+if (Array.isArray(v)) return v.map((x) => mapStrings(x, fn));
+if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, mapStrings(x, fn)]));
+return v;
+}
+/** AI 응답 글 → JSON 객체. 코드 블록·앞뒤 설명을 걷어 내고, 역슬래시 하나짜리 LaTeX를 문자열마다 고쳐 읽는다 */
+function parseJsonText(text) {
+const raw = extractJsonObject(text);
+if (raw == null) throw badResponse('AI 응답에 JSON이 없습니다: ' + String(text ?? '').slice(0, 160));
+let o;
+try { o = JSON.parse(repairJsonText(raw)); }
+catch (e) {
+try { o = JSON.parse(raw); } // 고친 글만 읽지 못하는 경우를 대비해 원래 글로도 읽어 본다
+catch { throw badResponse(`AI 응답을 JSON으로 읽지 못했습니다 (${e.message}): ${raw.slice(0, 160)}`); }
+}
+return mapStrings(o, fixRowBreaks);
+}
+const clean = (v) => { if (v == null) return null; const s = String(v).trim(); return !s || /^null$/i.test(s) ? null : s; };
+const PASSAGE_PLACEHOLDER = '공통 지문이 있는 경우 여기에 작성, 없으면 null';
+/** 문제 하나를 정해진 모양으로: 빈 값·"null" 글자는 null, 선지는 글자 배열, 난이도는 1~5 정수(아니면 null) */
+function normalizeProblem(o) {
+if (!o || typeof o !== 'object' || Array.isArray(o)) return null;
+let choices = o.choices;
+if (typeof choices === 'string') choices = choices.split(/(?=[\u2460-\u2473])/);
+choices = Array.isArray(choices) ? choices.map(clean).filter(Boolean) : [];
+// "3", "3단계", "4 (어려움)"처럼 글로 와도 앞의 숫자를 읽는다
+const lv = o.difficulty_level;
+const level = Math.round(Number(typeof lv === 'string' ? lv.match(/^\s*(\d+(?:\.\d+)?)(?!\d)/)?.[1] : lv));
+const fig = o.has_figure_or_diagram;
+const passage = clean(o.passage);
+return {
+problem_number: clean(o.problem_number),
+passage: passage === PASSAGE_PLACEHOLDER ? null : passage, // 예시 문구를 그대로 베낀 경우
+question: clean(o.question) ?? '',
+choices,
+has_figure_or_diagram: fig === true || /^(true|yes|있음)$/i.test(String(fig ?? '').trim()),
+topic: clean(o.topic),
+difficulty_level: level >= 1 && level <= 5 ? level : null,
+difficulty_reasoning: clean(o.difficulty_reasoning) ?? '',
+};
+}
+/** AI 응답 글 → 이 영역에서 읽은 문제 목록 (problems 배열이 없이 문제 하나만 온 경우도 받는다) */
+function parseAnalysis(text) {
+const o = parseJsonText(text);
+let list = o.problems;
+if (list && typeof list === 'object' && !Array.isArray(list)) list = [list];
+if (!Array.isArray(list)) list = 'question' in o || 'difficulty_level' in o ? [o] : [];
+const problems = list.map(normalizeProblem).filter((p) => p && (p.question || p.choices.length || p.difficulty_level != null));
+if (!problems.length) throw badResponse('AI 응답에 문제(problems)가 없습니다: ' + String(text ?? '').slice(0, 160));
+return problems;
+}
+/** 1~5단계(1 매우 쉬움 … 5 킬러)를 이 앱의 수능식 1~9등급(1이 가장 어려움)으로: 1→9, 2→7, 3→5, 4→3, 5→1 */
+const levelToGrade = (level) => (Number.isInteger(level) && level >= 1 && level <= 5 ? 11 - 2 * level : null);
+/** "01." "12번" "유제 1-2" → 문제 번호(마지막 숫자). 숫자가 없으면 null */
+const numberOf = (s) => { const m = String(s ?? '').normalize('NFKC').match(/\d+/g); return m ? +m[m.length - 1] : null; };
+/** 여러 문제를 읽었으면 이 항목 번호와 같은 문제, 없으면 첫 문제 */
+function primaryIndex(problems, item) {
+const i = problems.findIndex((p) => numberOf(p.problem_number) === item?.number);
+return i >= 0 ? i : 0;
+}
+// 과목 이름 비교용: 띄어쓰기·괄호를 빼고, 수학·미적분은 1·2 → I·II, 공통수학은 I·II → 1·2 (SUBJECTS의 표기에 맞춘다)
+const subjectKey = (s) => String(s ?? '').normalize('NFKC').replace(/[\s()（）]/g, '')
+.replace(/^(수학|미적분)([12])(?!\d)/, (m, w, d) => w + 'I'.repeat(+d))
+.replace(/^공통수학(II|I)(?![A-Za-z])/, (m, r) => '공통수학' + r.length);
+/** 단원 유형 글의 앞머리에서 과목을 찾는다 ("수학 II - 미분계수와 도함수" → 수학II, "수학Ⅰ" "수학 1"도). 없으면 null */
+function subjectFromTopic(topic) {
+const k = subjectKey(topic);
+let best = null;
+for (const s of SUBJECTS) {
+const sk = subjectKey(s);
+if (k.startsWith(sk) && (!best || sk.length > subjectKey(best).length)) best = s;
+}
+return best;
+}
+// LaTeX 명령을 자동 분류 규칙이 알아보는 기호·낱말로 (∫ Σ → ∞ √ ∘ ∈ …, 나머지는 명령 이름 그대로: \sin → sin)
+const LATEX_SYMBOLS = {
+int: '∫', iint: '∬', oint: '∮', sum: 'Σ', prod: 'Π', to: '→', rightarrow: '→', infty: '∞', sqrt: '√', times: '×', cdot: '·', div: '÷', pm: '±',
+circ: '∘', in: '∈', notin: '∉', subset: '⊂', subseteq: '⊆', supset: '⊃', supseteq: '⊇', cup: '∪', cap: '∩', emptyset: '∅', varnothing: '∅',
+le: '≤', leq: '≤', ge: '≥', geq: '≥', ne: '≠', neq: '≠', pi: 'π', theta: 'θ', alpha: 'α', beta: 'β', angle: '∠', triangle: '△', perp: '⊥', parallel: '∥',
+overline: '', vec: '', left: '', right: '', displaystyle: '', quad: ' ', qquad: ' ',
+};
+function latexToPlain(s) {
+let t = String(s ?? '');
+// 안쪽부터 풀어 나간다 (\frac{\sqrt{x}}{x} 같은 중첩)
+for (let k = 0, prev = null; k < 6 && prev !== t; k++) {
+prev = t;
+t = t.replace(/\\(?:text|mathrm|operatorname)\s*\{([^{}]*)\}/g, '$1')
+.replace(/\\sqrt\s*\{([^{}]*)\}/g, '√($1)')
+.replace(/\\[dt]?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, '($1)/($2)');
+}
+return t
+.replace(/\\([A-Za-z]+)/g, (m, name) => LATEX_SYMBOLS[name] ?? name)
+.replace(/\\[,;:! ]/g, ' ')
+.replace(/[{}$]/g, '')
+.replace(/[ \t]+/g, ' ').trim();
+}
+/** AI가 적은 단원 유형(topic)을 이 앱의 표준 유형으로: 단원 부분 → 전체 → 문제 글(LaTeX를 기호로 바꿔) 순서로 찾는다 */
+function typeFromAnalysis(p, subject) {
+const topic = p?.topic || '';
+const unit = topic.split(/\s*[-–—:>|]\s*/).filter(Boolean).pop() || '';
+const body = latexToPlain([p?.passage, p?.question, ...(p?.choices || [])].filter(Boolean).join('\n'));
+return normalizeType(unit, subject) || normalizeType(topic, subject) || normalizeType(body, subject) || null;
+}
+/** 저장한 분석 결과를 지정된 JSON 구조 {"problems": [...]}로 (항목 순서도 그대로) */
+function toSchemaJson(problems) {
+const empty = { choices: [], has_figure_or_diagram: false, question: '', difficulty_reasoning: '' };
+return { problems: (problems || []).map((p) => Object.fromEntries(PROBLEM_KEYS.map((k) => [k, p?.[k] ?? empty[k] ?? null]))) };
+}
+function summarize(problems, item, subjectHint) {
+const primary = primaryIndex(problems, item);
+const p = problems[primary];
+const subject = subjectFromTopic(p.topic);
+return {
+problems, primary, level: p.difficulty_level, grade: levelToGrade(p.difficulty_level),
+topic: p.topic, subject, type: typeFromAnalysis(p, subject || subjectHint), reason: p.difficulty_reasoning,
+};
 }
 function httpError(res, body) {
 const e = new Error(`HTTP ${res.status}: ${body.slice(0, 300)}`);
 e.status = res.status;
 return e;
 }
+async function send(provider, req) {
+const res = await fetch(req.url, req.init);
+if (!res.ok) throw httpError(res, await res.text());
+let j;
+try { j = await res.json(); } catch { throw badResponse('AI 서버의 응답을 읽지 못했습니다.'); }
+return { text: responseText(provider, j), note: stopNote(provider, j) };
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-/** 문제 1개 판정 (429/5xx 재시도) */
-async function gradeWithLLM(cfg, problem, solution, subjectHint) {
+/**
+* 문제 이미지 1장을 AI로 분석한다 (429·5xx는 기다렸다 다시, 읽을 수 없는 응답은 한 번 더).
+* 반환: { problems: 이 영역에서 읽은 문제들, primary: 이 항목에 해당하는 문제의 순번, level: 1~5단계, grade: 환산 등급(1~9),
+*         topic: 단원 유형 글, subject: 그 글의 과목, type: 이 앱의 표준 유형, reason: 난이도 근거 }
+*/
+async function analyzeWithLLM(cfg, problem, subjectHint) {
 const images = [await shrink(problem.image)];
-if (solution?.image) images.push(await shrink(solution.image));
-const prompt = buildPrompt(subjectHint, !!solution?.image);
+const req = buildRequest(cfg, OCR_SYSTEM_PROMPT, buildUserText(subjectHint), images);
 for (let attempt = 0; ; attempt++) {
 try {
-const r = await call(cfg, prompt, images);
-const subject = r.subject || subjectHint;
-r.type = normalizeType(r.type, subject) || normalizeType(r.unit, subject);
-return r;
+const { text, note } = await send(cfg.provider, req);
+let problems;
+try { problems = parseAnalysis(text); }
+catch (e) {
+if (note) { e.message = `${e.message} (${note})`; e.truncated = TRUNCATED.test(note); }
+throw e;
+}
+return summarize(problems, problem, subjectHint);
 } catch (e) {
-const retryable = e.status === 429 || (e.status >= 500 && e.status < 600);
+// 잘린 응답은 같은 요청으로 다시 보내도 또 잘리므로 다시 보내지 않는다
+const retryable = e.status === 429 || (e.status >= 500 && e.status < 600) || (e.badResponse && !e.truncated && attempt === 0);
 if (!retryable || attempt >= 3) throw e;
-await sleep(2000 * 2 ** attempt);
+await sleep(e.badResponse ? 1000 : 2000 * 2 ** attempt);
 }
 }
 }
@@ -391,7 +662,11 @@ try { return JSON.parse(localStorage.getItem('mathbook.llm') || '{}'); } catch {
 function saveConfig(cfg) {
 localStorage.setItem('mathbook.llm', JSON.stringify(cfg));
 }
-return { PROVIDERS, SUBJECTS, buildPrompt, parseJsonLoose, gradeWithLLM, loadConfig, saveConfig };
+return {
+PROVIDERS, SUBJECTS, OCR_SYSTEM_PROMPT, PROBLEM_KEYS, buildUserText, buildRequest, responseText, stopNote,
+extractJsonObject, repairJsonText, parseJsonText, parseAnalysis, levelToGrade, numberOf, primaryIndex,
+subjectFromTopic, latexToPlain, typeFromAnalysis, toSchemaJson, analyzeWithLLM, loadConfig, saveConfig,
+};
 })();
 M.build = (() => {
 const { textImage } = M.imaging;
@@ -696,6 +971,8 @@ for (const item of items) {
 const prev = prevOf.get(item);
 if (!prev) continue;
 for (const k of KEEP_ON_RESEGMENT) if (prev[k] != null) item[k] = prev[k];
+// AI가 옮겨 적은 문제 글은 그 영역의 것이다: 영역이 그대로면 그대로 쓰고, 바뀌었으면 '다시 분석 필요'로 표시해 둔다
+if (prev.aiExtract) item.aiExtract = sameRegions(prev.fragments, item.fragments) ? prev.aiExtract : { ...prev.aiExtract, stale: true };
 if (prev.answerManual || prev.answerLLM) Object.assign(item, { answer: prev.answer, answerManual: prev.answerManual, answerLLM: prev.answerLLM });
 // 사용자가 검토 화면에서 직접 고친 번호도 같은 자리의 문제에 그대로 둔다
 if (prev.detection?.numberManual) {
@@ -721,7 +998,11 @@ book.segmented = { ...(book.segmented || {}), [kind]: true };
 await db.update('books', book.id, (f) => { f.segmented = book.segmented; });
 return items;
 }
-const KEEP_ON_RESEGMENT = ['gradeManual', 'gradeLLM', 'unit', 'subjectLLM', 'llmReason', 'typeLLM', 'typeManual'];
+const KEEP_ON_RESEGMENT = ['gradeManual', 'gradeLLM', 'difficultyLLM', 'unit', 'subjectLLM', 'llmReason', 'typeLLM', 'typeManual'];
+/** 두 항목의 영역(쪽·상자)이 같은지 (다듬기 결과가 몇 px 다른 것은 같은 영역으로 본다) */
+function sameRegions(a = [], b = [], tol = 4) {
+return a.length === b.length && a.every((f, i) => f.page === b[i].page && ['x0', 'y0', 'x1', 'y1'].every((k) => Math.abs((f[k] ?? 0) - (b[i][k] ?? 0)) <= tol));
+}
 /** 원본 이미지가 없는 쪽(백업에서 빠진 쪽)에 걸친 항목을 다시 자르려 할 때의 오류. 기존 자르기는 그대로 둔다 */
 class PageImageMissingError extends Error {
 constructor(pages) {
@@ -833,6 +1114,6 @@ await terminateOcr(); // OCR 워커 메모리 해제 (다음 처리 때 다시 �
 }
 /** 다른 창에서 처리 중인 책인지 판단할 때 쓰는 기준 (이보다 오래 소식이 없으면 끊긴 것으로 본다) */
 const HEARTBEAT_STALE_MS = 5 * 60000;
-return { DEFAULT_OPTIONS, HEARTBEAT_STALE_MS, segmentKind, finalizeItem, pagesWithoutImage, PageImageMissingError, relink, ingestBook };
+return { DEFAULT_OPTIONS, HEARTBEAT_STALE_MS, segmentKind, finalizeItem, pagesWithoutImage, PageImageMissingError, relink, ingestBook, sameRegions };
 })();
 // ===== part2.js 끝 =====
