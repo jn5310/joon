@@ -1,0 +1,7 @@
+# 테스트가 만드는 임시 파일 (백업·내보내기 결과)
+tests/*.jsonl
+tests/backup.json
+tests/ai-export.json
+tests/node_modules/
+# 코드 검토 메모
+semantic-review/
